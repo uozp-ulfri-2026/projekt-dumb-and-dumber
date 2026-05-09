@@ -43,6 +43,8 @@ def load_articles(input_path: Path, text_field: str) -> list[dict[str, Any]]:
             "title": record.get("title", ""),
             "url": record.get("url", ""),
             "date": record.get("date", ""),
+            "category": record.get("category", ""),
+            "keywords": record.get("keywords", []),
             "text": text_value.strip(),
         }
         articles.append(article)
@@ -124,6 +126,8 @@ def save_outputs(
                 "title": article["title"],
                 "url": article["url"],
                 "date": article["date"],
+                "category": article["category"],
+                "keywords": article["keywords"],
                 "text": article["text"],
             }
             meta_file.write(json.dumps(metadata, ensure_ascii=False) + "\n")
@@ -213,10 +217,11 @@ def main() -> None:
     embeddings = embed_articles(
         articles=articles,
         model_name=args.model,
-        batch_size=args.batch_size,
+        batch_size=32,
         normalize_embeddings=normalize_embeddings,
         device=device,
     )
+    #batch_size=args.batch_size
 
     save_outputs(
         embeddings=embeddings,

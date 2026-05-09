@@ -69,6 +69,39 @@ def clean_value(value: Any, field_name: str | None = None) -> Any:
     return value
 
 
+def normalize_keywords(*values: Any) -> list[str]:
+    """
+    Normalize keyword-like fields into a deduplicated list.
+
+    The MMC YAML contains both human-provided `keywords` and generated
+    `gpt_keywords` on some records. Keep both, preserving source order.
+    """
+    keywords: list[str] = []
+    seen: set[str] = set()
+
+    for value in values:
+        if isinstance(value, str):
+            candidates = [item.strip() for item in re.split(r"[,;]", value)]
+        elif isinstance(value, list):
+            candidates = [item for item in value if isinstance(item, str)]
+        else:
+            continue
+
+        for candidate in candidates:
+            keyword = clean_text_value(candidate)
+            if not keyword:
+                continue
+
+            normalized = keyword.casefold()
+            if normalized in seen:
+                continue
+
+            seen.add(normalized)
+            keywords.append(keyword)
+
+    return keywords
+
+
 # ----------------------------
 # EMBEDDING TEXT CREATION
 # ----------------------------
@@ -88,6 +121,10 @@ def build_embedding_text(article: dict[str, Any]) -> str:
     title = article.get("title")
     if isinstance(title, str) and title:
         parts.append(title)
+
+    keywords = normalize_keywords(article.get("keywords"), article.get("gpt_keywords"))
+    if keywords:
+        parts.append("Ključne besede: " + ", ".join(keywords))
 
     lead = article.get("lead")
     if isinstance(lead, str) and lead:
@@ -124,6 +161,7 @@ def extract_yaml_to_json(input_path: Path, output_path: Path) -> None:
             continue
 
         cleaned = clean_value(record)
+        keywords = normalize_keywords(cleaned.get("keywords"), cleaned.get("gpt_keywords"))
 
         embedding_text = build_embedding_text(cleaned)
         if not embedding_text:
@@ -133,7 +171,8 @@ def extract_yaml_to_json(input_path: Path, output_path: Path) -> None:
             "id": cleaned.get("id", i),
             "title": cleaned.get("title", ""),
             "text": embedding_text,
-            "category": cleaned.get("category"),
+            "keywords": keywords,
+            "category": cleaned.get("category") or cleaned.get("topics"),
             "date": cleaned.get("date"),
             "url": cleaned.get("url"),
         }
@@ -148,7 +187,8 @@ def extract_yaml_to_json(input_path: Path, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with output_path.open("w", encoding="utf-8") as target_file:
-        json.dump(cleaned_records, target_file, ensure_ascii=False)
+        json.dump(cleaned_records, target_file, ensure_ascii=False, indent=2)
+        target_file.write("\n")
 
     print("Done.")
 

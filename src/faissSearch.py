@@ -273,6 +273,8 @@ def main() -> None:
                 "title": article.get("title"),
                 "url": article.get("url"),
                 "date": article.get("date"),
+                "category": article.get("category"),
+                "keywords": article.get("keywords", []),
                 "text": article.get("text"),
             }
         )
