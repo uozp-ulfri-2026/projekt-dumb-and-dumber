@@ -612,7 +612,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sample-size",
         type=int,
-        default=73363,
+        default=5000,
         help="Random number of articles to visualize.",
     )
     parser.add_argument(
