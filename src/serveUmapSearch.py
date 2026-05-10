@@ -63,10 +63,10 @@ class FaissSearchService:
         self.model = SentenceTransformer(self.model_name, local_files_only=local_files_only)
         self.model_lock = Lock()
 
-    def search_top_one(self, query: str) -> dict[str, Any] | None:
+    def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
         query = query.strip()
         if not query:
-            return None
+            return []
 
         with self.model_lock:
             query_embedding = self.model.encode(
@@ -79,26 +79,32 @@ class FaissSearchService:
         scores, indices = search_top_k(
             index=self.index,
             query_vector=np.asarray(query_embedding[0], dtype=np.float32),
-            top_k=1,
+            top_k=top_k,
             metric=self.metric,
             normalized=self.normalized,
         )
-        if len(indices) == 0 or int(indices[0]) < 0:
-            return None
 
-        article_index = int(indices[0])
-        article = self.metadata[article_index]
-        return {
-            "rank": 1,
-            "score": float(scores[0]),
-            "article_index": article_index,
-            "id": article.get("id"),
-            "title": article.get("title"),
-            "url": article.get("url"),
-            "date": article.get("date"),
-            "category": article.get("category"),
-            "keywords": article.get("keywords", []),
-        }
+        results: list[dict[str, Any]] = []
+        for rank, (index, score) in enumerate(zip(indices, scores), start=1):
+            if int(index) < 0:
+                continue
+
+            article_index = int(index)
+            article = self.metadata[article_index]
+            results.append(
+                {
+                    "rank": rank,
+                    "score": float(score),
+                    "article_index": article_index,
+                    "id": article.get("id"),
+                    "title": article.get("title"),
+                    "url": article.get("url"),
+                    "date": article.get("date"),
+                    "category": article.get("category"),
+                    "keywords": article.get("keywords", []),
+                }
+            )
+        return results
 
 
 class UmapSearchHandler(SimpleHTTPRequestHandler):
@@ -126,13 +132,13 @@ class UmapSearchHandler(SimpleHTTPRequestHandler):
             return
 
         try:
-            result = self.service.search_top_one(query)
+            results = self.service.search(query, top_k=5)
         except Exception as exc:  # pragma: no cover - visible through the browser.
             LOGGER.exception("Search failed")
             self.send_json({"error": str(exc)}, status=500)
             return
 
-        self.send_json({"query": query, "result": result})
+        self.send_json({"query": query, "results": results, "result": results[0] if results else None})
 
     def send_json(self, payload: dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -145,7 +151,7 @@ class UmapSearchHandler(SimpleHTTPRequestHandler):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Serve the UMAP Plotly HTML with a FAISS top-1 search endpoint."
+        description="Serve the UMAP Plotly HTML with a FAISS top-5 search endpoint."
     )
     parser.add_argument(
         "--host",

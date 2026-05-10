@@ -20,10 +20,10 @@ python src/visualizeUmap.py
 
 The script caches the 2D UMAP projection in `data/mmc_embeddings/umap_cache/` so reruns reuse the previous layout unless the inputs or settings change. The generated figure shows two side-by-side panels: one colored by clustering and one colored by article topic.
 
-Serve the visualization with FAISS top-1 search enabled:
+Serve the visualization with FAISS top-5 search enabled:
 
 ```powershell
 python src/serveUmapSearch.py
 ```
 
-Then open `http://127.0.0.1:8000/`. Search highlights the top result when that article is part of the sampled UMAP points; otherwise it shows the matched article title and link. Clicking an article point opens its source URL in a new tab.
+Then open `http://127.0.0.1:8000/`. Search highlights the top results that are part of the sampled UMAP points and lists all five matches with scores. Clicking an article point opens its source URL in a new tab.
