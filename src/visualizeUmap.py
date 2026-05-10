@@ -183,8 +183,8 @@ def _color_for_index(index: int) -> str:
 def _group_traces(
     plot_rows: list[dict[str, Any]],
     group_key: str,
-    legend_title: str,
     axis_name: str,
+    show_legend: bool = True,
 ) -> list[go.Scattergl]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in plot_rows:
@@ -198,7 +198,8 @@ def _group_traces(
                 y=[row["y"] for row in group_rows],
                 mode="markers",
                 name=group_name,
-                legendgroup=axis_name,
+                legendgroup=f"{axis_name}:{group_name}",
+                showlegend=show_legend,
                 marker={"color": _color_for_index(index), "size": 6, "opacity": 0.78, "line": {"width": 0}},
                 customdata=[
                     [row["title"], row["cluster"], row["topic"], row["date"], row["keywords"], row["url"]]
@@ -206,7 +207,6 @@ def _group_traces(
                 ],
                 hovertemplate=(
                     "<b>%{customdata[0]}</b><br>"
-                    f"{legend_title}: %{{fullData.name}}<br>"
                     "Cluster: %{customdata[1]}<br>"
                     "Topic: %{customdata[2]}<br>"
                     "Date: %{customdata[3]}<br>"
@@ -228,10 +228,10 @@ def build_figure(plot_rows: list[dict[str, Any]], total_articles: int) -> go.Fig
         horizontal_spacing=0.07,
     )
 
-    for trace in _group_traces(plot_rows, group_key="cluster", legend_title="Cluster", axis_name="cluster"):
+    for trace in _group_traces(plot_rows, group_key="cluster", axis_name="cluster", show_legend=True):
         fig.add_trace(trace, row=1, col=1)
 
-    for trace in _group_traces(plot_rows, group_key="topic", legend_title="Topic", axis_name="topic"):
+    for trace in _group_traces(plot_rows, group_key="topic", axis_name="topic", show_legend=False):
         fig.add_trace(trace, row=1, col=2)
 
     fig.update_layout(
@@ -239,7 +239,7 @@ def build_figure(plot_rows: list[dict[str, Any]], total_articles: int) -> go.Fig
         width=1800,
         height=900,
         title={"text": f"MMC articles UMAP ({len(plot_rows)} sampled from {total_articles})", "x": 0.5},
-        legend_title_text="Group",
+        legend_title_text="Cluster",
     )
     fig.update_xaxes(title_text="UMAP 1")
     fig.update_yaxes(title_text="UMAP 2")
