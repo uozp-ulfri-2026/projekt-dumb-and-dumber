@@ -507,6 +507,23 @@ def build_faiss_search_script() -> str:
         return `${escapeHtml(prefix)} ${link}${suffix}`;
     }
 
+    graph.on("plotly_click", function (eventData) {
+        const point = eventData.points && eventData.points[0];
+        if (!point || point.data && point.data.meta && point.data.meta.faissHighlight) {
+            return;
+        }
+
+        const custom = point.customdata;
+        if (!Array.isArray(custom) || !custom[5]) {
+            return;
+        }
+
+        const articleWindow = window.open(String(custom[5]), "_blank", "noopener,noreferrer");
+        if (articleWindow) {
+            articleWindow.opener = null;
+        }
+    });
+
     form.addEventListener("submit", async function (event) {
         event.preventDefault();
         const query = input.value.trim();
