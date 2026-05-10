@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -181,6 +182,13 @@ def _color_for_index(index: int) -> str:
     return palette[index % len(palette)]
 
 
+def _natural_sort_key(value: str) -> tuple[tuple[int, int | str], ...]:
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r"(\d+)", value)
+    )
+
+
 def _group_traces(
     plot_rows: list[dict[str, Any]],
     group_key: str,
@@ -192,14 +200,17 @@ def _group_traces(
         grouped.setdefault(str(row[group_key]), []).append(row)
 
     traces: list[go.Scattergl] = []
-    for index, (group_name, group_rows) in enumerate(sorted(grouped.items(), key=lambda item: item[0])):
+    sorted_groups = sorted(grouped.items(), key=lambda item: _natural_sort_key(item[0]))
+    legend_group_title = "Clusters" if axis_name == "cluster" else "Topics"
+    for index, (group_name, group_rows) in enumerate(sorted_groups):
+        legend_options: dict[str, Any] = {"legendgrouptitle": {"text": legend_group_title}} if index == 0 else {}
         traces.append(
             go.Scattergl(
                 x=[row["x"] for row in group_rows],
                 y=[row["y"] for row in group_rows],
                 mode="markers",
                 name=group_name,
-                legendgroup=f"{axis_name}:{group_name}",
+                legendgroup=axis_name,
                 showlegend=show_legend,
                 marker={"color": _color_for_index(index), "size": 6, "opacity": 0.78, "line": {"width": 0}},
                 customdata=[
@@ -222,6 +233,7 @@ def _group_traces(
                     "Keywords: %{customdata[4]}<br>"
                     "<extra></extra>"
                 ),
+                **legend_options,
             )
         )
     return traces
@@ -240,7 +252,7 @@ def build_figure(plot_rows: list[dict[str, Any]], total_articles: int) -> go.Fig
     for trace in _group_traces(plot_rows, group_key="cluster", axis_name="cluster", show_legend=True):
         fig.add_trace(trace, row=1, col=1)
 
-    for trace in _group_traces(plot_rows, group_key="topic", axis_name="topic", show_legend=False):
+    for trace in _group_traces(plot_rows, group_key="topic", axis_name="topic", show_legend=True):
         fig.add_trace(trace, row=1, col=2)
 
     fig.update_layout(
@@ -248,10 +260,14 @@ def build_figure(plot_rows: list[dict[str, Any]], total_articles: int) -> go.Fig
         width=1800,
         height=900,
         title={"text": f"MMC articles UMAP ({len(plot_rows)} sampled from {total_articles})", "x": 0.5},
-        legend_title_text="Cluster",
+        legend={"groupclick": "toggleitem", "tracegroupgap": 10},
+        legend_title_text="",
+        dragmode="zoom",
     )
     fig.update_xaxes(title_text="UMAP 1")
     fig.update_yaxes(title_text="UMAP 2")
+    fig.update_xaxes(matches="x", row=1, col=2)
+    fig.update_yaxes(matches="y", row=1, col=2)
     return fig
 
 
@@ -279,7 +295,7 @@ def build_faiss_search_script() -> str:
         }
         .faiss-search-form {
             display: grid;
-            grid-template-columns: minmax(220px, 1fr) auto auto;
+            grid-template-columns: minmax(220px, 1fr) auto auto auto;
             gap: 8px;
             align-items: center;
         }
@@ -292,7 +308,8 @@ def build_faiss_search_script() -> str:
             font-size: 14px;
         }
         .faiss-search-button,
-        .faiss-reset-button {
+        .faiss-reset-button,
+        .faiss-clear-button {
             height: 38px;
             padding: 0 13px;
             border: 1px solid #1d4ed8;
@@ -302,13 +319,15 @@ def build_faiss_search_script() -> str:
             font-size: 14px;
             cursor: pointer;
         }
-        .faiss-reset-button {
+        .faiss-reset-button,
+        .faiss-clear-button {
             border-color: #c9d1db;
             background: #ffffff;
             color: #1f2937;
         }
         .faiss-search-button:disabled,
-        .faiss-reset-button:disabled {
+        .faiss-reset-button:disabled,
+        .faiss-clear-button:disabled {
             cursor: progress;
             opacity: 0.72;
         }
@@ -325,6 +344,16 @@ def build_faiss_search_script() -> str:
         .faiss-search-status a:hover {
             text-decoration: underline;
         }
+        .faiss-results {
+            margin: 8px 0 0;
+            padding-left: 22px;
+        }
+        .faiss-results li {
+            margin: 3px 0;
+        }
+        .faiss-result-missing {
+            color: #6b7280;
+        }
         @media (max-width: 720px) {
             .faiss-search-form {
                 grid-template-columns: 1fr;
@@ -333,15 +362,17 @@ def build_faiss_search_script() -> str:
     `;
     document.head.appendChild(style);
 
+    const defaultStatus = "Za FAISS search odpri stran prek lokalnega serverja: python src/serveUmapSearch.py";
     const panel = document.createElement("section");
     panel.className = "faiss-search-panel";
     panel.innerHTML = `
         <form class="faiss-search-form">
-            <input class="faiss-search-input" name="query" type="search" placeholder="FAISS search top 1..." autocomplete="off" />
+            <input class="faiss-search-input" name="query" type="search" placeholder="FAISS search top 5..." autocomplete="off" />
             <button class="faiss-search-button" type="submit">Search</button>
             <button class="faiss-reset-button" type="button">Reset view</button>
+            <button class="faiss-clear-button" type="button">Reset</button>
         </form>
-        <div class="faiss-search-status">Za FAISS search odpri stran prek lokalnega serverja: python src/serveUmapSearch.py</div>
+        <div class="faiss-search-status">${defaultStatus}</div>
     `;
     graph.parentNode.insertBefore(panel, graph);
 
@@ -349,6 +380,7 @@ def build_faiss_search_script() -> str:
     const input = panel.querySelector(".faiss-search-input");
     const submitButton = panel.querySelector(".faiss-search-button");
     const resetButton = panel.querySelector(".faiss-reset-button");
+    const clearButton = panel.querySelector(".faiss-clear-button");
     const status = panel.querySelector(".faiss-search-status");
 
     function setStatus(message, isHtml) {
@@ -393,8 +425,10 @@ def build_faiss_search_script() -> str:
                     xaxis: trace.xaxis || "x",
                     yaxis: trace.yaxis || "y",
                     title: custom[0],
+                    cluster: custom[1],
                     topic: custom[2],
                     date: custom[3],
+                    keywords: custom[4],
                     url: custom[5],
                     originalIndex: custom[6]
                 });
@@ -412,13 +446,56 @@ def build_faiss_search_script() -> str:
             }
         }
         if (indices.length > 0) {
-            return Plotly.deleteTraces(graph, indices.reverse());
+            return Plotly.deleteTraces(graph, indices.reverse()).then(clearHighlightAnnotations);
         }
-        return Promise.resolve();
+        return clearHighlightAnnotations();
+    }
+
+    function clearHighlightAnnotations() {
+        const annotations = (graph.layout.annotations || []).filter(function (annotation) {
+            return annotation.name !== "faissHighlight";
+        });
+        return Plotly.relayout(graph, {annotations: annotations});
     }
 
     function axisLayoutName(axisRef) {
         return axisRef === "x" || axisRef === "y" ? axisRef + "axis" : axisRef.replace(/^([xy])/, "$1axis");
+    }
+
+    function pairedAxisName(axisName) {
+        return {
+            xaxis: "xaxis2",
+            xaxis2: "xaxis",
+            yaxis: "yaxis2",
+            yaxis2: "yaxis"
+        }[axisName] || "";
+    }
+
+    function axisRangeFromEvent(eventData, axisName) {
+        if (Array.isArray(eventData[axisName + ".range"])) {
+            return eventData[axisName + ".range"];
+        }
+        const start = eventData[axisName + ".range[0]"];
+        const end = eventData[axisName + ".range[1]"];
+        if (start !== undefined && end !== undefined) {
+            return [start, end];
+        }
+        return null;
+    }
+
+    function buildSyncedRelayout(eventData) {
+        const relayout = {};
+        for (const axisName of ["xaxis", "xaxis2", "yaxis", "yaxis2"]) {
+            const pairedAxis = pairedAxisName(axisName);
+            const range = axisRangeFromEvent(eventData, axisName);
+            if (pairedAxis && range) {
+                relayout[pairedAxis + ".range"] = range;
+            }
+            if (pairedAxis && eventData[axisName + ".autorange"] !== undefined) {
+                relayout[pairedAxis + ".autorange"] = eventData[axisName + ".autorange"];
+            }
+        }
+        return relayout;
     }
 
     function currentBounds(axisName, coordinateKey) {
@@ -470,24 +547,78 @@ def build_faiss_search_script() -> str:
         return Object.keys(relayout).length > 0 ? Plotly.relayout(graph, relayout) : Promise.resolve();
     }
 
+    function formatScore(score) {
+        return Number.isFinite(Number(score)) ? Number(score).toFixed(4) : "";
+    }
+
+    function highlightColor(rank) {
+        const colors = ["#ef4444", "#f97316", "#eab308", "#22c55e", "#06b6d4"];
+        const index = Math.max(0, Math.min(colors.length - 1, Number(rank || 1) - 1));
+        return colors[index];
+    }
+
+    function highlightAnnotation(match) {
+        const isFirst = Number(match.rank) === 1;
+        return {
+            name: "faissHighlight",
+            x: match.x,
+            y: match.y,
+            xref: match.xaxis || "x",
+            yref: match.yaxis || "y",
+            text: isFirst ? "★" : "■",
+            showarrow: false,
+            xanchor: "center",
+            yanchor: "middle",
+            align: "center",
+            font: {
+                size: isFirst ? 52 : 38,
+                color: highlightColor(match.rank),
+                family: "Arial Black, Arial, sans-serif"
+            },
+            opacity: 1
+        };
+    }
+
     async function highlight(matches) {
         await clearHighlights();
-        const traces = matches.map(function (match) {
+        const orderedMatches = matches.slice().sort(function (left, right) {
+            return Number(right.rank || 0) - Number(left.rank || 0);
+        });
+        const traces = orderedMatches.map(function (match) {
             return {
+                type: "scatter",
                 x: [match.x],
                 y: [match.y],
                 xaxis: match.xaxis,
                 yaxis: match.yaxis,
                 mode: "markers",
-                name: "FAISS top 1",
+                name: "FAISS top " + match.rank,
                 showlegend: false,
-                hovertemplate: "<b>%{customdata[0]}</b><br>FAISS top 1<br><extra></extra>",
-                customdata: [[match.title]],
+                hovertemplate: (
+                    "<b>%{customdata[0]}</b><br>"
+                    + "FAISS rank: %{customdata[6]}<br>"
+                    + "Cluster: %{customdata[1]}<br>"
+                    + "Topic: %{customdata[2]}<br>"
+                    + "Date: %{customdata[3]}<br>"
+                    + "Keywords: %{customdata[4]}<br>"
+                    + "Score: %{customdata[5]}<br>"
+                    + "<extra></extra>"
+                ),
+                customdata: [[
+                    match.title,
+                    match.cluster,
+                    match.topic,
+                    match.date,
+                    match.keywords,
+                    formatScore(match.score),
+                    match.rank
+                ]],
                 marker: {
-                    symbol: "star",
-                    size: 20,
-                    color: "#ef4444",
-                    line: {color: "#111827", width: 2}
+                    symbol: Number(match.rank) === 1 ? "star" : "square",
+                    size: Number(match.rank) === 1 ? 48 : 40,
+                    color: highlightColor(match.rank),
+                    opacity: 0.01,
+                    line: {color: "#111827", width: 0}
                 },
                 meta: {faissHighlight: true}
             };
@@ -496,15 +627,30 @@ def build_faiss_search_script() -> str:
             await Plotly.addTraces(graph, traces);
         }
         await focusMatches(matches);
+        const baseAnnotations = (graph.layout.annotations || []).filter(function (annotation) {
+            return annotation.name !== "faissHighlight";
+        });
+        await Plotly.relayout(graph, {
+            annotations: baseAnnotations.concat(orderedMatches.map(highlightAnnotation))
+        });
     }
 
-    function resultHtml(result, prefix) {
+    function resultHtml(result, inSample) {
         const title = escapeHtml(result.title || "Brez naslova");
-        const score = Number.isFinite(Number(result.score)) ? Number(result.score).toFixed(4) : "";
+        const score = formatScore(result.score);
         const url = result.url ? String(result.url) : "";
         const link = url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${title}</a>` : title;
-        const suffix = score ? ` (score ${score})` : "";
-        return `${escapeHtml(prefix)} ${link}${suffix}`;
+        const scoreHtml = score ? ` <span>score: <strong>${escapeHtml(score)}</strong></span>` : "";
+        const missingHtml = inSample ? "" : ` <span class="faiss-result-missing">(ni v trenutnem UMAP vzorcu)</span>`;
+        return `${link}${scoreHtml}${missingHtml}`;
+    }
+
+    function resultsHtml(results, pointLookup) {
+        const items = results.map(function (result) {
+            const inSample = (pointLookup.get(String(result.article_index)) || []).length > 0;
+            return `<li>${resultHtml(result, inSample)}</li>`;
+        });
+        return `Top 5:<ol class="faiss-results">${items.join("")}</ol>`;
     }
 
     graph.on("plotly_click", function (eventData) {
@@ -524,6 +670,23 @@ def build_faiss_search_script() -> str:
         }
     });
 
+    let syncingAxes = false;
+    graph.on("plotly_relayout", async function (eventData) {
+        if (syncingAxes) {
+            return;
+        }
+        const relayout = buildSyncedRelayout(eventData || {});
+        if (Object.keys(relayout).length === 0) {
+            return;
+        }
+        syncingAxes = true;
+        try {
+            await Plotly.relayout(graph, relayout);
+        } finally {
+            syncingAxes = false;
+        }
+    });
+
     form.addEventListener("submit", async function (event) {
         event.preventDefault();
         const query = input.value.trim();
@@ -533,7 +696,7 @@ def build_faiss_search_script() -> str:
         }
 
         submitButton.disabled = true;
-        setStatus("Searching FAISS top 1...");
+        setStatus("Searching FAISS top 5...");
         try {
             const response = await fetch("/api/search?query=" + encodeURIComponent(query), {
                 headers: {"Accept": "application/json"}
@@ -542,22 +705,31 @@ def build_faiss_search_script() -> str:
                 throw new Error("HTTP " + response.status);
             }
             const payload = await response.json();
-            const result = payload.result;
-            if (!result) {
+            const results = payload.results || (payload.result ? [payload.result] : []);
+            if (results.length === 0) {
                 await clearHighlights();
                 setStatus("Ni zadetka.");
                 return;
             }
 
-            const matches = buildPointLookup().get(String(result.article_index)) || [];
-            if (matches.length === 0) {
-                await clearHighlights();
-                setStatus(resultHtml(result, "Top 1 ni v trenutnem UMAP vzorcu:"), true);
-                return;
+            const pointLookup = buildPointLookup();
+            const scoredMatches = [];
+            for (const result of results) {
+                const matches = pointLookup.get(String(result.article_index)) || [];
+                for (const match of matches) {
+                    scoredMatches.push(Object.assign({}, match, {
+                        rank: result.rank,
+                        score: result.score
+                    }));
+                }
             }
 
-            await highlight(matches);
-            setStatus(resultHtml(result, "Top 1:"), true);
+            if (scoredMatches.length > 0) {
+                await highlight(scoredMatches);
+            } else {
+                await clearHighlights();
+            }
+            setStatus(resultsHtml(results, pointLookup), true);
         } catch (error) {
             setStatus("FAISS endpoint ni dosegljiv. Zaženi: python src/serveUmapSearch.py");
         } finally {
@@ -567,6 +739,17 @@ def build_faiss_search_script() -> str:
 
     resetButton.addEventListener("click", async function () {
         resetButton.disabled = true;
+        await Plotly.relayout(graph, {
+            "xaxis.autorange": true,
+            "yaxis.autorange": true,
+            "xaxis2.autorange": true,
+            "yaxis2.autorange": true
+        });
+        resetButton.disabled = false;
+    });
+
+    clearButton.addEventListener("click", async function () {
+        clearButton.disabled = true;
         await clearHighlights();
         await Plotly.relayout(graph, {
             "xaxis.autorange": true,
@@ -574,8 +757,9 @@ def build_faiss_search_script() -> str:
             "xaxis2.autorange": true,
             "yaxis2.autorange": true
         });
-        setStatus("Pogled je resetiran.");
-        resetButton.disabled = false;
+        input.value = "";
+        setStatus(defaultStatus);
+        clearButton.disabled = false;
     });
 }());
 """
@@ -612,7 +796,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sample-size",
         type=int,
-        default=5000,
+        default=73363,
         help="Random number of articles to visualize.",
     )
     parser.add_argument(
@@ -704,7 +888,7 @@ def main() -> None:
         file=str(output_html),
         include_plotlyjs="cdn",
         auto_open=False,
-        config={"displayModeBar": False},
+        config={"displayModeBar": False, "doubleClick": False, "scrollZoom": False, "showTips": False},
         post_script=build_faiss_search_script(),
     )
     LOGGER.info("Saved Plotly visualization to %s", output_html)
