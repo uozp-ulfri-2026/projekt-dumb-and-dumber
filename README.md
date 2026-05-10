@@ -27,4 +27,3 @@ python src/serveUmapSearch.py
 ```
 
 Then open `http://127.0.0.1:8000/`. Search highlights the top result when that article is part of the sampled UMAP points; otherwise it shows the matched article title and link. Clicking an article point opens its source URL in a new tab.
-By default the server uses the locally cached sentence-transformers model; add `--allow-model-download` if you need it to download missing model files.

@@ -704,6 +704,7 @@ def main() -> None:
         file=str(output_html),
         include_plotlyjs="cdn",
         auto_open=False,
+        config={"displayModeBar": False},
         post_script=build_faiss_search_script(),
     )
     LOGGER.info("Saved Plotly visualization to %s", output_html)
