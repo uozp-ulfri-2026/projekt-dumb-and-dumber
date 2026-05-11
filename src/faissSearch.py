@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from sentence_transformers.cross_encoders import CrossEncoder
 
 try:
     import faiss  # type: ignore
@@ -120,12 +121,38 @@ def embed_query_text(query_text: str, model_name: str, normalize_embeddings: boo
     LOGGER.info("Embedding text query with model '%s'", model_name)
     model = SentenceTransformer(model_name)
     query = model.encode(
-        [query_text],
+        [f"query: {query_text}"],
         convert_to_numpy=True,
         normalize_embeddings=normalize_embeddings,
         show_progress_bar=False,
     )
     return np.asarray(query[0], dtype=np.float32)
+
+
+def rerank_results(
+    query_text: str,
+    candidates: list[dict[str, Any]],
+    reranker_model_name: str,
+) -> list[dict[str, Any]]:
+    if not candidates or not query_text:
+        return candidates
+
+    LOGGER.info("Loading cross-encoder reranker '%s'", reranker_model_name)
+    reranker = CrossEncoder(reranker_model_name)
+
+    pairs = [[query_text, candidate["text"]] for candidate in candidates]
+    scores = reranker.predict(pairs)
+
+    for candidate, score in zip(candidates, scores):
+        candidate["reranker_score"] = float(score)
+
+    reranked = sorted(candidates, key=lambda x: x.get("reranker_score", 0), reverse=True)
+
+    for rank, result in enumerate(reranked, start=1):
+        result["rerank"] = rank
+
+    LOGGER.info("Reranked %d candidates. Top: score=%.4f", len(reranked), reranked[0]["reranker_score"])
+    return reranked
 
 
 def search_top_k(
@@ -226,7 +253,7 @@ def main() -> None:
 
     metric = "cosine"
     normalized = True
-    model_name = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    model_name = "intfloat/multilingual-e5-large"
     if args.config.exists():
         with args.config.open("r", encoding="utf-8") as cfg_file:
             cfg = json.load(cfg_file)
@@ -252,10 +279,14 @@ def main() -> None:
     else:
         query = load_query_embedding(args, expected_dim=embeddings.shape[1])
 
+    rerank_k = args.rerank_top_k if args.rerank_top_k is not None else args.top_k
+    faiss_k = max(args.top_k, rerank_k) if args.reranker else args.top_k
+
+    LOGGER.info("Retrieving top %d results from FAISS (will rerank top %d)", faiss_k, rerank_k if args.reranker else "N/A")
     scores, indices = search_top_k(
         index=index,
         query_vector=query,
-        top_k=args.top_k,
+        top_k=faiss_k,
         metric=metric,
         normalized=normalized,
     )
@@ -279,6 +310,18 @@ def main() -> None:
             }
         )
 
+    if args.reranker and args.query is not None:
+        candidates_to_rerank = results[:rerank_k]
+        results = rerank_results(
+            query_text=args.query,
+            candidates=candidates_to_rerank,
+            reranker_model_name=args.reranker,
+        )
+    else:
+        if args.reranker and args.query is None:
+            LOGGER.warning("Reranker requested but no text query provided. Skipping reranking.")
+
+    results = results[:args.top_k]
     print(json.dumps(results, ensure_ascii=False, indent=2))
 
 

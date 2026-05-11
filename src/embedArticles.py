@@ -72,6 +72,21 @@ def resolve_device(device: str) -> str:
     return "cpu"
 
 
+def build_weighted_embedding_text(article: dict[str, Any]) -> str:
+    title = str(article.get("title", "")).strip()
+    body_text = str(article.get("text", "")).strip()
+
+    parts: list[str] = []
+    if title:
+        parts.append(f"title: {title}")
+        parts.append(f"title: {title}")
+        parts.append(f"title: {title}")
+    if body_text:
+        parts.append(f"passage: {body_text}")
+
+    return " ".join(parts).strip()
+
+
 def embed_articles(
     articles: list[dict[str, Any]],
     model_name: str,
@@ -81,7 +96,7 @@ def embed_articles(
 ) -> np.ndarray:
     LOGGER.info("Loading model '%s' on device '%s'", model_name, device)
     model = SentenceTransformer(model_name, device=device)
-    texts = [article["text"] for article in articles]
+    texts = [build_weighted_embedding_text(article) for article in articles]
 
     LOGGER.info(
         "Encoding %d articles (batch_size=%d, normalize=%s)",
@@ -137,6 +152,7 @@ def save_outputs(
         "model_name": model_name,
         "normalize_embeddings": normalize_embeddings,
         "metric": "cosine",
+        "text_weighting": "title repeated 3x before passage body",
         "num_vectors": int(embeddings.shape[0]),
         "vector_dim": int(embeddings.shape[1]),
         "embeddings_file": embeddings_path.name,
@@ -170,7 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         type=str,
-        default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        default="intfloat/multilingual-e5-large",
         help="Sentence-transformers model name.",
     )
     parser.add_argument(
@@ -217,11 +233,10 @@ def main() -> None:
     embeddings = embed_articles(
         articles=articles,
         model_name=args.model,
-        batch_size=32,
+        batch_size=args.batch_size,
         normalize_embeddings=normalize_embeddings,
         device=device,
     )
-    #batch_size=args.batch_size
 
     save_outputs(
         embeddings=embeddings,
