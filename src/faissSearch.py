@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import re
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.cross_encoder import CrossEncoder
 
@@ -172,6 +173,110 @@ def search_top_k(
     return scores[0], indices[0]
 
 
+def _split_into_sentences(text: str) -> list[str]:
+    text = text.replace("\n", " ").strip()
+    # Try spaCy sentencizer first (fast rule-based), then NLTK, then regex fallback.
+    try:
+        import spacy
+
+        # Use a blank English pipeline with sentencizer to avoid heavy model downloads
+        nlp = spacy.blank("en")
+        if "sentencizer" not in nlp.pipe_names:
+            nlp.add_pipe("sentencizer")
+        doc = nlp(text)
+        sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+        if sentences:
+            return sentences
+    except Exception:
+        pass
+
+    try:
+        import nltk
+        from nltk.tokenize import sent_tokenize
+
+        # Ensure punkt is available; download quietly if needed
+        try:
+            nltk.data.find("tokenizers/punkt")
+        except Exception:
+            try:
+                nltk.download("punkt", quiet=True)
+            except Exception:
+                pass
+
+        sentences = sent_tokenize(text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        if sentences:
+            return sentences
+    except Exception:
+        pass
+
+    # Fallback: simple regex-based split keeping punctuation
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    return [s.strip() for s in sentences if s and not s.isspace()]
+
+
+def _is_junk_sentence(s: str, min_chars: int = 30, min_words: int = 5) -> bool:
+    s = s.strip()
+    if len(s) < min_chars:
+        return True
+    if len(s.split()) < min_words:
+        return True
+    if re.match(r'^(figure|fig|table|caption|image|photo)[:\s]', s[:12].lower()):
+        return True
+    if s.isupper():
+        return True
+    if len(re.findall(r'[A-Za-z]', s)) < 5:
+        return True
+    return False
+
+
+def extract_top_sentences_for_article(
+    article_text: str,
+    query_vector: np.ndarray,
+    model_name: str = "intfloat/multilingual-e5-large",
+    top_k: int = 3,
+    min_score: float = 0.15,
+    model: SentenceTransformer | None = None,
+) -> list[dict[str, float]]:
+    """Return up to top_k sentences from article_text that best match query_vector.
+
+    Sentences that are too short or look like captions/junk are filtered out.
+    """
+    if not article_text or not str(article_text).strip():
+        return []
+
+    sentences = _split_into_sentences(str(article_text))
+    sentences = [s for s in sentences if not _is_junk_sentence(s)]
+    if not sentences:
+        return []
+
+    if model is None:
+        model = SentenceTransformer(model_name)
+
+    sent_emb = model.encode(
+        sentences,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    ).astype(np.float32, copy=False)
+
+    q = np.asarray(query_vector, dtype=np.float32).reshape(-1)
+    q_norm = q / (np.linalg.norm(q) + 1e-12)
+
+    sims = np.dot(sent_emb, q_norm)
+    indices = np.argsort(sims)[::-1]
+    out: list[dict[str, float]] = []
+    for idx in indices:
+        score = float(sims[int(idx)])
+        if score < min_score:
+            continue
+        out.append({"sentence": sentences[int(idx)], "score": score})
+        if len(out) >= top_k:
+            break
+
+    return out
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build a FAISS index over article embeddings and return top-k nearest articles."
@@ -322,6 +427,25 @@ def main() -> None:
             LOGGER.warning("Reranker requested but no text query provided. Skipping reranking.")
 
     results = results[:args.top_k]
+    # Add explanatory top sentences for the top result when a text query was provided
+    if args.query is not None and results:
+        try:
+            # load model once and reuse for sentence embeddings
+            expl_model = SentenceTransformer(model_name)
+            top_article = results[0]
+            article_text = top_article.get("text", "") or ""
+            top_sents = extract_top_sentences_for_article(
+                article_text,
+                query_vector=query,
+                model_name=model_name,
+                top_k=3,
+                min_score=0.15,
+                model=expl_model,
+            )
+            if top_sents:
+                top_article["top_sentences"] = top_sents
+        except Exception:
+            LOGGER.exception("Failed to compute explanatory top sentences for result.")
     print(json.dumps(results, ensure_ascii=False, indent=2))
 
 
