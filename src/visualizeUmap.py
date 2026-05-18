@@ -191,12 +191,16 @@ def build_cluster_tfidf_labels(
     cluster_ids = np.unique(cluster_labels)
     grouped_docs: list[str] = []
     sorted_cluster_ids = sorted(int(cluster_id) for cluster_id in cluster_ids)
+    dominant_topics: dict[int, str] = {}
 
     for cluster_id in sorted_cluster_ids:
         text_parts: list[str] = []
+        topic_counts: dict[str, int] = {}
         row_indices = np.where(cluster_labels == cluster_id)[0]
         for row_index in row_indices:
             article = metadata[int(sample_indices[int(row_index)])]
+            topic = str(article.get("category", "") or "Uncategorized").strip() or "Uncategorized"
+            topic_counts[topic] = topic_counts.get(topic, 0) + 1
             article_text = str(article.get("text", "")).strip()
             if not article_text:
                 title = str(article.get("title", "")).strip()
@@ -206,9 +210,17 @@ def build_cluster_tfidf_labels(
             if article_text:
                 text_parts.append(article_text)
         grouped_docs.append("\n".join(text_parts))
+        if topic_counts:
+            dominant_topic = sorted(topic_counts.items(), key=lambda item: (-item[1], item[0].casefold()))[0][0]
+        else:
+            dominant_topic = "Uncategorized"
+        dominant_topics[cluster_id] = dominant_topic
 
     if not grouped_docs or not any(doc.strip() for doc in grouped_docs):
-        return {cluster_id: f"Cluster {cluster_id + 1}" for cluster_id in sorted_cluster_ids}
+        return {
+            cluster_id: f"Cluster {cluster_id + 1} ({dominant_topics.get(cluster_id, 'Uncategorized')})"
+            for cluster_id in sorted_cluster_ids
+        }
 
     vectorizer = TfidfVectorizer(
         lowercase=True,
@@ -222,13 +234,17 @@ def build_cluster_tfidf_labels(
         tfidf_matrix = vectorizer.fit_transform(grouped_docs)
         feature_names = vectorizer.get_feature_names_out()
     except ValueError:
-        return {cluster_id: f"Cluster {cluster_id + 1}" for cluster_id in sorted_cluster_ids}
+        return {
+            cluster_id: f"Cluster {cluster_id + 1} ({dominant_topics.get(cluster_id, 'Uncategorized')})"
+            for cluster_id in sorted_cluster_ids
+        }
 
     labels: dict[int, str] = {}
     for row_pos, cluster_id in enumerate(sorted_cluster_ids):
         row = tfidf_matrix.getrow(row_pos)
+        topic_label = dominant_topics.get(cluster_id, "Uncategorized")
         if row.nnz == 0:
-            labels[cluster_id] = f"Cluster {cluster_id + 1}"
+            labels[cluster_id] = f"Cluster {cluster_id + 1} ({topic_label})"
             continue
 
         weights = row.toarray().ravel()
@@ -236,10 +252,10 @@ def build_cluster_tfidf_labels(
         top_words = [feature_names[index] for index in top_indices if weights[index] > 0]
 
         if not top_words:
-            labels[cluster_id] = f"Cluster {cluster_id + 1}"
+            labels[cluster_id] = f"Cluster {cluster_id + 1} ({topic_label})"
             continue
 
-        labels[cluster_id] = f"Cluster {cluster_id + 1}: {', '.join(top_words)}"
+        labels[cluster_id] = f"Cluster {cluster_id + 1} ({topic_label}): {', '.join(top_words)}"
 
     return labels
 
