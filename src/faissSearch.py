@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from sentence_transformers.cross_encoders import CrossEncoder
+from sentence_transformers import CrossEncoder
 
 try:
     import faiss  # type: ignore
