@@ -14,6 +14,7 @@ import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
 from sklearn.cluster import KMeans
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 import umap
 
@@ -157,16 +158,20 @@ def build_plot_data(
     sample_indices: np.ndarray,
     coordinates: np.ndarray,
     cluster_labels: np.ndarray,
+    cluster_names: dict[int, str] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    cluster_names = cluster_names or {}
     for sample_row, original_index in enumerate(sample_indices):
         article = metadata[int(original_index)]
+        cluster_id = int(cluster_labels[sample_row])
+        cluster_name = cluster_names.get(cluster_id, f"Cluster {cluster_id + 1}")
         rows.append(
             {
                 "x": float(coordinates[sample_row, 0]),
                 "y": float(coordinates[sample_row, 1]),
                 "original_index": int(original_index),
-                "cluster": f"Cluster {int(cluster_labels[sample_row]) + 1}",
+                "cluster": cluster_name,
                 "topic": str(article.get("category", "") or "Uncategorized"),
                 "title": article.get("title", ""),
                 "date": article.get("date", ""),
@@ -175,6 +180,68 @@ def build_plot_data(
             }
         )
     return rows
+
+
+def build_cluster_tfidf_labels(
+    metadata: list[dict[str, Any]],
+    sample_indices: np.ndarray,
+    cluster_labels: np.ndarray,
+    top_k_words: int = 5,
+) -> dict[int, str]:
+    cluster_ids = np.unique(cluster_labels)
+    grouped_docs: list[str] = []
+    sorted_cluster_ids = sorted(int(cluster_id) for cluster_id in cluster_ids)
+
+    for cluster_id in sorted_cluster_ids:
+        text_parts: list[str] = []
+        row_indices = np.where(cluster_labels == cluster_id)[0]
+        for row_index in row_indices:
+            article = metadata[int(sample_indices[int(row_index)])]
+            article_text = str(article.get("text", "")).strip()
+            if not article_text:
+                title = str(article.get("title", "")).strip()
+                keywords = article.get("keywords", [])
+                keywords_text = " ".join(str(keyword) for keyword in keywords if isinstance(keyword, str))
+                article_text = " ".join(part for part in [title, keywords_text] if part).strip()
+            if article_text:
+                text_parts.append(article_text)
+        grouped_docs.append("\n".join(text_parts))
+
+    if not grouped_docs or not any(doc.strip() for doc in grouped_docs):
+        return {cluster_id: f"Cluster {cluster_id + 1}" for cluster_id in sorted_cluster_ids}
+
+    vectorizer = TfidfVectorizer(
+        lowercase=True,
+        stop_words="english",
+        max_df=0.9,
+        min_df=1,
+        token_pattern=r"(?u)\b\w\w+\b",
+    )
+
+    try:
+        tfidf_matrix = vectorizer.fit_transform(grouped_docs)
+        feature_names = vectorizer.get_feature_names_out()
+    except ValueError:
+        return {cluster_id: f"Cluster {cluster_id + 1}" for cluster_id in sorted_cluster_ids}
+
+    labels: dict[int, str] = {}
+    for row_pos, cluster_id in enumerate(sorted_cluster_ids):
+        row = tfidf_matrix.getrow(row_pos)
+        if row.nnz == 0:
+            labels[cluster_id] = f"Cluster {cluster_id + 1}"
+            continue
+
+        weights = row.toarray().ravel()
+        top_indices = np.argsort(weights)[::-1][:top_k_words]
+        top_words = [feature_names[index] for index in top_indices if weights[index] > 0]
+
+        if not top_words:
+            labels[cluster_id] = f"Cluster {cluster_id + 1}"
+            continue
+
+        labels[cluster_id] = f"Cluster {cluster_id + 1}: {', '.join(top_words)}"
+
+    return labels
 
 
 def _color_for_index(index: int) -> str:
@@ -872,11 +939,19 @@ def main() -> None:
         force_recompute=args.force_recompute,
     )
 
+    cluster_name_map = build_cluster_tfidf_labels(
+        metadata=metadata,
+        sample_indices=projection["sample_indices"],
+        cluster_labels=projection["cluster_labels"],
+        top_k_words=5,
+    )
+
     plot_rows = build_plot_data(
         metadata=metadata,
         sample_indices=projection["sample_indices"],
         coordinates=projection["coordinates"],
         cluster_labels=projection["cluster_labels"],
+        cluster_names=cluster_name_map,
     )
 
     fig = build_figure(plot_rows=plot_rows, total_articles=len(metadata))

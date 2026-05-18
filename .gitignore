@@ -4,3 +4,4 @@ src/__pycache__
 requirements.txt
 setup_venv_windows.ps1
 setup_venv.sh
+src.zip
