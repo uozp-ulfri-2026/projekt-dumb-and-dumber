@@ -218,7 +218,7 @@ def build_cluster_tfidf_labels(
 
     if not grouped_docs or not any(doc.strip() for doc in grouped_docs):
         return {
-            cluster_id: f"Cluster {cluster_id + 1} ({dominant_topics.get(cluster_id, 'Uncategorized')})"
+            cluster_id: format_cluster_label(cluster_id, dominant_topics.get(cluster_id, "Uncategorized"), [])
             for cluster_id in sorted_cluster_ids
         }
 
@@ -235,7 +235,7 @@ def build_cluster_tfidf_labels(
         feature_names = vectorizer.get_feature_names_out()
     except ValueError:
         return {
-            cluster_id: f"Cluster {cluster_id + 1} ({dominant_topics.get(cluster_id, 'Uncategorized')})"
+            cluster_id: format_cluster_label(cluster_id, dominant_topics.get(cluster_id, "Uncategorized"), [])
             for cluster_id in sorted_cluster_ids
         }
 
@@ -244,7 +244,7 @@ def build_cluster_tfidf_labels(
         row = tfidf_matrix.getrow(row_pos)
         topic_label = dominant_topics.get(cluster_id, "Uncategorized")
         if row.nnz == 0:
-            labels[cluster_id] = f"Cluster {cluster_id + 1} ({topic_label})"
+            labels[cluster_id] = format_cluster_label(cluster_id, topic_label, [])
             continue
 
         weights = row.toarray().ravel()
@@ -252,12 +252,40 @@ def build_cluster_tfidf_labels(
         top_words = [feature_names[index] for index in top_indices if weights[index] > 0]
 
         if not top_words:
-            labels[cluster_id] = f"Cluster {cluster_id + 1} ({topic_label})"
+            labels[cluster_id] = format_cluster_label(cluster_id, topic_label, [])
             continue
 
-        labels[cluster_id] = f"Cluster {cluster_id + 1} ({topic_label}): {', '.join(top_words)}"
+        labels[cluster_id] = format_cluster_label(cluster_id, topic_label, top_words)
 
     return labels
+
+
+def format_cluster_label(
+    cluster_id: int,
+    topic_label: str,
+    top_words: list[str],
+    max_length: int = 48,
+) -> str:
+    topic_label = " ".join(str(topic_label).split()) or "Uncategorized"
+    word_part = ", ".join(top_words[:3])
+    base = f"C{cluster_id + 1:02d} | {topic_label}"
+    if word_part:
+        base = f"{base} | {word_part}"
+
+    if len(base) <= max_length:
+        return base
+
+    shortened_topic = topic_label
+    if len(shortened_topic) > 24:
+        shortened_topic = shortened_topic[:21].rstrip() + "..."
+
+    base = f"C{cluster_id + 1:02d} | {shortened_topic}"
+    if word_part:
+        base = f"{base} | {word_part}"
+    if len(base) <= max_length:
+        return base
+
+    return base[: max(0, max_length - 3)].rstrip() + "..."
 
 
 def _color_for_index(index: int) -> str:
@@ -436,6 +464,19 @@ def build_faiss_search_script() -> str:
         }
         .faiss-result-missing {
             color: #6b7280;
+        }
+        .faiss-result-snippets {
+            margin: 6px 0 0;
+            padding-left: 18px;
+            color: #374151;
+        }
+        .faiss-result-snippets li {
+            margin: 3px 0;
+            line-height: 1.35;
+        }
+        .faiss-result-snippet-score {
+            color: #6b7280;
+            font-size: 12px;
         }
         @media (max-width: 720px) {
             .faiss-search-form {
@@ -725,7 +766,16 @@ def build_faiss_search_script() -> str:
         const link = url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${title}</a>` : title;
         const scoreHtml = score ? ` <span>score: <strong>${escapeHtml(score)}</strong></span>` : "";
         const missingHtml = inSample ? "" : ` <span class="faiss-result-missing">(ni v trenutnem UMAP vzorcu)</span>`;
-        return `${link}${scoreHtml}${missingHtml}`;
+        const snippets = Array.isArray(result.top_sentences) ? result.top_sentences : [];
+        const snippetHtml = snippets.length > 0
+            ? `<ol class="faiss-result-snippets">${snippets.map(function (sentence) {
+                const sentenceText = escapeHtml(sentence.sentence || "");
+                const sentenceScore = formatScore(sentence.score);
+                const sentenceScoreHtml = sentenceScore ? ` <span class="faiss-result-snippet-score">(${escapeHtml(sentenceScore)})</span>` : "";
+                return `<li><strong>${sentenceText}</strong>${sentenceScoreHtml}</li>`;
+            }).join("")}</ol>`
+            : "";
+        return `${link}${scoreHtml}${missingHtml}${snippetHtml}`;
     }
 
     function resultsHtml(results, pointLookup) {
@@ -903,7 +953,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cluster-count",
         type=int,
-        default=16,
+        default=50,
         help="Maximum number of clusters to color code.",
     )
     parser.add_argument(

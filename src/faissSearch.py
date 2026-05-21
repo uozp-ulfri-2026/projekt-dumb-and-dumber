@@ -329,6 +329,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to query embedding file (.npy or JSON array).",
     )
     parser.add_argument(
+        "--reranker",
+        type=str,
+        default=None,
+        help="Optional cross-encoder model name for reranking the initial FAISS candidates.",
+    )
+    parser.add_argument(
+        "--rerank-top-k",
+        type=int,
+        default=None,
+        help="Number of FAISS candidates to rerank before truncating to --top-k.",
+    )
+    parser.add_argument(
         "--top-k",
         type=int,
         default=5,
@@ -387,7 +399,14 @@ def main() -> None:
     rerank_k = args.rerank_top_k if args.rerank_top_k is not None else args.top_k
     faiss_k = max(args.top_k, rerank_k) if args.reranker else args.top_k
 
-    LOGGER.info("Retrieving top %d results from FAISS (will rerank top %d)", faiss_k, rerank_k if args.reranker else "N/A")
+    if args.reranker:
+        LOGGER.info(
+            "Retrieving top %d results from FAISS (will rerank top %d)",
+            faiss_k,
+            rerank_k,
+        )
+    else:
+        LOGGER.info("Retrieving top %d results from FAISS", faiss_k)
     scores, indices = search_top_k(
         index=index,
         query_vector=query,

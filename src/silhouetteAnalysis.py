@@ -11,7 +11,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_samples, silhouette_score
-from sklearn.preprocessing import normalize
 
 
 LOGGER = logging.getLogger("silhouette_analysis")
@@ -39,7 +38,7 @@ def load_metadata(metadata_path: Path) -> list[dict[str, Any]]:
     return metadata
 
 
-def extract_topic_labels(metadata: list[dict[str, Any]]) -> np.ndarray:
+def extract_topic_labels(metadata: list[dict[str, Any]]) -> tuple[np.ndarray, list[str]]:
     """Extract category/topic labels from metadata."""
     topics = [str(record.get("category", "Uncategorized")) for record in metadata]
     
@@ -65,6 +64,30 @@ def compute_kmeans_clusters(
     return labels, kmeans
 
 
+def run_kmeans_sweep(
+    embeddings: np.ndarray,
+    cluster_counts: list[int],
+    seed: int,
+    metric: str,
+) -> list[dict[str, Any]]:
+    sweep_results: list[dict[str, Any]] = []
+
+    for n_clusters in cluster_counts:
+        LOGGER.info("Running KMeans silhouette sweep for %d clusters", n_clusters)
+        labels, _ = compute_kmeans_clusters(embeddings, n_clusters=n_clusters, seed=seed)
+        overall_score, sample_scores = compute_silhouette_metrics(embeddings, labels, metric=metric)
+        cluster_stats = compute_cluster_statistics(labels, sample_scores)
+        sweep_results.append(
+            {
+                "n_clusters": int(n_clusters),
+                "overall_score": float(overall_score),
+                "per_cluster": cluster_stats,
+            }
+        )
+
+    return sweep_results
+
+
 def compute_silhouette_metrics(
     embeddings: np.ndarray,
     labels: np.ndarray,
@@ -72,8 +95,10 @@ def compute_silhouette_metrics(
 ) -> tuple[float, np.ndarray]:
     """Compute overall and per-sample silhouette scores."""
     LOGGER.info("Computing silhouette scores (metric=%s)", metric)
-    overall_score = silhouette_score(embeddings, labels, metric=metric, sample_size=min(10000, len(embeddings)))
-    sample_scores = silhouette_samples(embeddings, labels, metric=metric)
+    overall_score = float(
+        silhouette_score(embeddings, labels, metric=metric, sample_size=min(80000, len(embeddings)))
+    )
+    sample_scores = np.asarray(silhouette_samples(embeddings, labels, metric=metric), dtype=np.float32)
     LOGGER.info("Overall silhouette score: %.4f", overall_score)
     return overall_score, sample_scores
 
@@ -263,9 +288,35 @@ def build_silhouette_comparison_figure(
     return fig
 
 
+def build_kmeans_sweep_figure(sweep_results: list[dict[str, Any]]) -> go.Figure:
+    cluster_counts = [result["n_clusters"] for result in sweep_results]
+    scores = [result["overall_score"] for result in sweep_results]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=cluster_counts,
+            y=scores,
+            mode="lines+markers",
+            marker={"size": 9},
+            line={"width": 3},
+            name="KMeans silhouette",
+        )
+    )
+
+    fig.update_layout(
+        title="KMeans Silhouette Sweep",
+        xaxis_title="Number of clusters",
+        yaxis_title="Overall silhouette score",
+        height=600,
+        template="plotly_white",
+    )
+    return fig
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Silhouette analysis for KMeans clusters and article topics."
+        description="Silhouette analysis for a KMeans cluster sweep."
     )
     parser.add_argument(
         "--embeddings",
@@ -280,10 +331,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to metadata JSONL file.",
     )
     parser.add_argument(
-        "--n-clusters",
+        "--start-clusters",
         type=int,
-        default=10,
-        help="Number of KMeans clusters.",
+        default=5,
+        help="Starting number of KMeans clusters for the sweep.",
+    )
+    parser.add_argument(
+        "--end-clusters",
+        type=int,
+        default=20,
+        help="Ending number of KMeans clusters for the sweep.",
+    )
+    parser.add_argument(
+        "--step",
+        type=int,
+        default=1,
+        help="Step between cluster counts in the sweep.",
     )
     parser.add_argument(
         "--seed",
@@ -328,93 +391,69 @@ def main() -> None:
         raise ValueError(
             f"Embeddings shape[0] ({len(embeddings)}) != metadata records ({len(metadata)})"
         )
-    
-    # Extract topic labels
-    topic_labels, unique_topics = extract_topic_labels(metadata)
-    
-    # Compute KMeans clusters
-    kmeans_labels, kmeans_model = compute_kmeans_clusters(
-        embeddings,
-        n_clusters=args.n_clusters,
+
+    if args.step <= 0:
+        raise ValueError("--step must be greater than 0.")
+    if args.start_clusters < 2:
+        raise ValueError("--start-clusters must be at least 2.")
+    if args.end_clusters < args.start_clusters:
+        raise ValueError("--end-clusters must be greater than or equal to --start-clusters.")
+
+    cluster_counts = [
+        n_clusters
+        for n_clusters in range(args.start_clusters, args.end_clusters + 1, args.step)
+        if n_clusters < len(embeddings)
+    ]
+    if not cluster_counts:
+        raise ValueError("No valid cluster counts remain after applying the requested range.")
+
+    sweep_results = run_kmeans_sweep(
+        embeddings=embeddings,
+        cluster_counts=cluster_counts,
         seed=args.seed,
+        metric=args.metric,
     )
-    
-    # Compute silhouette scores
-    kmeans_overall, kmeans_samples = compute_silhouette_metrics(embeddings, kmeans_labels, metric=args.metric)
-    topic_overall, topic_samples = compute_silhouette_metrics(embeddings, topic_labels, metric=args.metric)
-    
-    # Compute statistics
-    kmeans_stats = compute_cluster_statistics(kmeans_labels, kmeans_samples)
-    topic_stats = compute_cluster_statistics(topic_labels, topic_samples, unique_topics)
-    
-    # Print statistics
-    print(format_statistics(kmeans_overall, kmeans_stats, "KMeans Clustering Analysis"))
-    print(format_statistics(topic_overall, topic_stats, "Article Topics Analysis"))
-    
-    # Print summary comparison
+
     print(f"\n{'=' * 80}")
-    print("  Summary Comparison")
+    print("  KMeans Silhouette Sweep")
     print(f"{'=' * 80}")
-    print(f"KMeans Overall Silhouette Score:  {kmeans_overall:.4f}")
-    print(f"Topics Overall Silhouette Score:  {topic_overall:.4f}")
-    print(f"Difference (Topics - KMeans):     {topic_overall - kmeans_overall:.4f}")
-    if topic_overall > kmeans_overall:
-        print("→ Article topics are MORE coherent than random KMeans clusters")
-    else:
-        print("→ KMeans clusters are MORE coherent than article topics")
+    print(f"Range: {args.start_clusters}..{args.end_clusters} step {args.step}")
+    print(f"Metric: {args.metric}")
+    print(f"Seed:   {args.seed}")
+    print()
+
+    print(f"{'Clusters':<10} {'Overall':<10}")
+    print("-" * 22)
+    for result in sweep_results:
+        print(f"{result['n_clusters']:<10} {result['overall_score']:<10.4f}")
+
+    best_run = max(sweep_results, key=lambda item: item["overall_score"])
+    print()
+    print(f"Best cluster count: {best_run['n_clusters']} (silhouette {best_run['overall_score']:.4f})")
     print()
     
     # Save outputs
     if not args.no_plots:
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save bar charts
-        kmeans_fig = build_silhouette_bar_chart(
-            kmeans_stats,
-            "Silhouette Scores: KMeans Clusters",
-        )
-        kmeans_fig.write_html(args.output_dir / "silhouette_kmeans.html")
-        LOGGER.info("Saved KMeans silhouette chart to %s", args.output_dir / "silhouette_kmeans.html")
-        
-        topic_fig = build_silhouette_bar_chart(
-            topic_stats,
-            "Silhouette Scores: Article Topics",
-        )
-        topic_fig.write_html(args.output_dir / "silhouette_topics.html")
-        LOGGER.info("Saved Topics silhouette chart to %s", args.output_dir / "silhouette_topics.html")
-        
-        # Save comparison figure
-        comparison_fig = build_silhouette_comparison_figure(
-            kmeans_stats,
-            topic_stats,
-            kmeans_overall,
-            topic_overall,
-        )
-        comparison_fig.write_html(args.output_dir / "silhouette_comparison.html")
-        LOGGER.info("Saved comparison chart to %s", args.output_dir / "silhouette_comparison.html")
-        
-        # Save statistics as JSON
+
+        sweep_fig = build_kmeans_sweep_figure(sweep_results)
+        sweep_fig.write_html(args.output_dir / "silhouette_kmeans_sweep.html")
+        LOGGER.info("Saved KMeans sweep chart to %s", args.output_dir / "silhouette_kmeans_sweep.html")
+
         results = {
-            "kmeans": {
-                "overall_score": float(kmeans_overall),
-                "n_clusters": args.n_clusters,
-                "per_cluster": kmeans_stats,
-            },
-            "topics": {
-                "overall_score": float(topic_overall),
-                "n_topics": len(unique_topics),
-                "topics": list(unique_topics),
-                "per_topic": topic_stats,
-            },
-            "comparison": {
-                "kmeans_more_coherent": kmeans_overall > topic_overall,
-                "difference": float(topic_overall - kmeans_overall),
+            "kmeans_sweep": sweep_results,
+            "best_run": {
+                "n_clusters": int(best_run["n_clusters"]),
+                "overall_score": float(best_run["overall_score"]),
             },
             "metadata": {
                 "n_articles": len(embeddings),
                 "embedding_dim": embeddings.shape[1],
                 "metric": args.metric,
                 "seed": args.seed,
+                "start_clusters": args.start_clusters,
+                "end_clusters": args.end_clusters,
+                "step": args.step,
             },
         }
         

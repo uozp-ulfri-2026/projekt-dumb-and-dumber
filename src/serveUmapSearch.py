@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from faissSearch import load_metadata, load_or_build_index, search_top_k
+from faissSearch import extract_top_sentences_for_article, load_metadata, load_or_build_index, search_top_k
 
 
 LOGGER = logging.getLogger("serve_umap_search")
@@ -91,6 +91,14 @@ class FaissSearchService:
 
             article_index = int(index)
             article = self.metadata[article_index]
+            top_sentences = extract_top_sentences_for_article(
+                article_text=str(article.get("text", "") or ""),
+                query_vector=np.asarray(query_embedding[0], dtype=np.float32),
+                model_name=self.model_name,
+                top_k=3,
+                min_score=0.12,
+                model=self.model,
+            )
             results.append(
                 {
                     "rank": rank,
@@ -102,6 +110,7 @@ class FaissSearchService:
                     "date": article.get("date"),
                     "category": article.get("category"),
                     "keywords": article.get("keywords", []),
+                    "top_sentences": top_sentences,
                 }
             )
         return results
