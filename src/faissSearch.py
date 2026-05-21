@@ -174,45 +174,65 @@ def search_top_k(
 
 
 def _split_into_sentences(text: str) -> list[str]:
-    text = text.replace("\n", " ").strip()
-    # Try spaCy sentencizer first (fast rule-based), then NLTK, then regex fallback.
-    try:
-        import spacy
+    text = text.strip()
+    if not text:
+        return []
 
-        # Use a blank English pipeline with sentencizer to avoid heavy model downloads
-        nlp = spacy.blank("en")
-        if "sentencizer" not in nlp.pipe_names:
-            nlp.add_pipe("sentencizer")
-        doc = nlp(text)
-        sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
-        if sentences:
-            return sentences
-    except Exception:
-        pass
+    paragraphs = [part.strip() for part in re.split(r"\n{2,}", text) if part.strip()]
+    if not paragraphs:
+        paragraphs = [text]
 
-    try:
-        import nltk
-        from nltk.tokenize import sent_tokenize
+    def split_block(block: str) -> list[str]:
+        block = block.strip()
+        if not block:
+            return []
 
-        # Ensure punkt is available; download quietly if needed
+        keyword_match = re.match(r"^Ključne besede:\s*(.+)$", block, flags=re.IGNORECASE | re.DOTALL)
+        if keyword_match:
+            return [f"Ključne besede: {keyword_match.group(1).strip()}"]
+
+        block = block.replace("\n", " ").strip()
+
         try:
-            nltk.data.find("tokenizers/punkt")
+            import spacy
+
+            nlp = spacy.blank("en")
+            if "sentencizer" not in nlp.pipe_names:
+                nlp.add_pipe("sentencizer")
+            doc = nlp(block)
+            sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+            if sentences:
+                return sentences
         except Exception:
+            pass
+
+        try:
+            import nltk
+            from nltk.tokenize import sent_tokenize
+
             try:
-                nltk.download("punkt", quiet=True)
+                nltk.data.find("tokenizers/punkt")
             except Exception:
-                pass
+                try:
+                    nltk.download("punkt", quiet=True)
+                except Exception:
+                    pass
 
-        sentences = sent_tokenize(text)
-        sentences = [s.strip() for s in sentences if s.strip()]
-        if sentences:
-            return sentences
-    except Exception:
-        pass
+            sentences = sent_tokenize(block)
+            sentences = [s.strip() for s in sentences if s.strip()]
+            if sentences:
+                return sentences
+        except Exception:
+            pass
 
-    # Fallback: simple regex-based split keeping punctuation
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    return [s.strip() for s in sentences if s and not s.isspace()]
+        sentences = re.split(r'(?<=[.!?])\s+', block)
+        return [s.strip() for s in sentences if s and not s.isspace()]
+
+    sentences: list[str] = []
+    for paragraph in paragraphs:
+        sentences.extend(split_block(paragraph))
+
+    return [sentence for sentence in sentences if sentence]
 
 
 def _is_junk_sentence(s: str, min_chars: int = 30, min_words: int = 5) -> bool:

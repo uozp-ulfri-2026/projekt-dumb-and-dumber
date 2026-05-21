@@ -983,13 +983,8 @@ def main() -> None:
             f"Metadata size ({len(metadata)}) does not match number of embeddings ({embeddings.shape[0]})."
         )
 
-    unique_topics = {
-        str(article.get("category", "")).strip()
-        for article in metadata
-        if str(article.get("category", "")).strip()
-    }
-    cluster_count = min(max(len(unique_topics), 8), args.cluster_count)
-    LOGGER.info("Using up to %d clusters based on topic diversity", cluster_count)
+    cluster_count = args.cluster_count
+    LOGGER.info("Using up to %d clusters for KMeans coloring", cluster_count)
 
     projection = load_or_compute_projection(
         embeddings=embeddings,

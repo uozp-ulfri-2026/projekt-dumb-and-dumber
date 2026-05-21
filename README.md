@@ -143,7 +143,7 @@ sample-size     = 73363
 seed            = 42
 umap-neighbors  = 30
 umap-min-dist   = 0.08
-cluster-count   = 16
+cluster-count   = 50
 force-recompute = false
 ```
 
