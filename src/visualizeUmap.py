@@ -406,7 +406,7 @@ def build_faiss_search_script() -> str:
         }
         .faiss-search-form {
             display: grid;
-            grid-template-columns: minmax(220px, 1fr) auto auto auto;
+            grid-template-columns: minmax(220px, 1fr) auto auto auto auto;
             gap: 8px;
             align-items: center;
         }
@@ -419,6 +419,7 @@ def build_faiss_search_script() -> str:
             font-size: 14px;
         }
         .faiss-search-button,
+        .faiss-reranker-toggle,
         .faiss-reset-button,
         .faiss-clear-button {
             height: 38px;
@@ -430,6 +431,15 @@ def build_faiss_search_script() -> str:
             font-size: 14px;
             cursor: pointer;
         }
+        .faiss-reranker-toggle {
+            border-color: #15803d;
+            background: #16a34a;
+        }
+        .faiss-reranker-toggle[aria-pressed="false"] {
+            border-color: #c9d1db;
+            background: #ffffff;
+            color: #1f2937;
+        }
         .faiss-reset-button,
         .faiss-clear-button {
             border-color: #c9d1db;
@@ -437,6 +447,7 @@ def build_faiss_search_script() -> str:
             color: #1f2937;
         }
         .faiss-search-button:disabled,
+        .faiss-reranker-toggle:disabled,
         .faiss-reset-button:disabled,
         .faiss-clear-button:disabled {
             cursor: progress;
@@ -486,13 +497,14 @@ def build_faiss_search_script() -> str:
     `;
     document.head.appendChild(style);
 
-    const defaultStatus = "Za FAISS search odpri stran prek lokalnega serverja: python src/serveUmapSearch.py";
+    const defaultStatus = "Search uses FAISS candidates followed by cross-encoder reranking. Start with: python src/serveUmapSearch.py";
     const panel = document.createElement("section");
     panel.className = "faiss-search-panel";
     panel.innerHTML = `
         <form class="faiss-search-form">
-            <input class="faiss-search-input" name="query" type="search" placeholder="FAISS search top 5..." autocomplete="off" />
+            <input class="faiss-search-input" name="query" type="search" placeholder="FAISS + reranker search top 5..." autocomplete="off" />
             <button class="faiss-search-button" type="submit">Search</button>
+            <button class="faiss-reranker-toggle" type="button" aria-pressed="true">Reranker: on</button>
             <button class="faiss-reset-button" type="button">Reset view</button>
             <button class="faiss-clear-button" type="button">Reset</button>
         </form>
@@ -503,9 +515,11 @@ def build_faiss_search_script() -> str:
     const form = panel.querySelector("form");
     const input = panel.querySelector(".faiss-search-input");
     const submitButton = panel.querySelector(".faiss-search-button");
+    const rerankerToggle = panel.querySelector(".faiss-reranker-toggle");
     const resetButton = panel.querySelector(".faiss-reset-button");
     const clearButton = panel.querySelector(".faiss-clear-button");
     const status = panel.querySelector(".faiss-search-status");
+    let useReranker = true;
 
     function setStatus(message, isHtml) {
         if (isHtml) {
@@ -716,16 +730,17 @@ def build_faiss_search_script() -> str:
                 xaxis: match.xaxis,
                 yaxis: match.yaxis,
                 mode: "markers",
-                name: "FAISS top " + match.rank,
+                name: (match.useReranker ? "Reranked top " : "FAISS top ") + match.rank,
                 showlegend: false,
                 hovertemplate: (
                     "<b>%{customdata[0]}</b><br>"
-                    + "FAISS rank: %{customdata[6]}<br>"
+                    + "Final rank: %{customdata[6]}<br>"
                     + "Cluster: %{customdata[1]}<br>"
                     + "Topic: %{customdata[2]}<br>"
                     + "Date: %{customdata[3]}<br>"
                     + "Keywords: %{customdata[4]}<br>"
-                    + "Score: %{customdata[5]}<br>"
+                    + "FAISS score: %{customdata[5]}<br>"
+                    + "Reranker score: %{customdata[7]}<br>"
                     + "<extra></extra>"
                 ),
                 customdata: [[
@@ -735,7 +750,8 @@ def build_faiss_search_script() -> str:
                     match.date,
                     match.keywords,
                     formatScore(match.score),
-                    match.rank
+                    match.rank,
+                    formatScore(match.rerankerScore)
                 ]],
                 marker: {
                     symbol: Number(match.rank) === 1 ? "star" : "square",
@@ -759,12 +775,24 @@ def build_faiss_search_script() -> str:
         });
     }
 
-    function resultHtml(result, inSample) {
+    function resultHtml(result, inSample, useReranker) {
         const title = escapeHtml(result.title || "Brez naslova");
         const score = formatScore(result.score);
+        const rerankerScore = useReranker ? formatScore(result.reranker_score) : "";
+        const faissRank = result.faiss_rank ? String(result.faiss_rank) : "";
         const url = result.url ? String(result.url) : "";
         const link = url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${title}</a>` : title;
-        const scoreHtml = score ? ` <span>score: <strong>${escapeHtml(score)}</strong></span>` : "";
+        const scoreParts = [];
+        if (rerankerScore) {
+            scoreParts.push(`reranker: <strong>${escapeHtml(rerankerScore)}</strong>`);
+        }
+        if (score) {
+            scoreParts.push(`FAISS: <strong>${escapeHtml(score)}</strong>`);
+        }
+        if (faissRank) {
+            scoreParts.push(`FAISS rank: <strong>${escapeHtml(faissRank)}</strong>`);
+        }
+        const scoreHtml = scoreParts.length > 0 ? ` <span>${scoreParts.join(" | ")}</span>` : "";
         const missingHtml = inSample ? "" : ` <span class="faiss-result-missing">(ni v trenutnem UMAP vzorcu)</span>`;
         const snippets = Array.isArray(result.top_sentences) ? result.top_sentences : [];
         const snippetHtml = snippets.length > 0
@@ -778,12 +806,13 @@ def build_faiss_search_script() -> str:
         return `${link}${scoreHtml}${missingHtml}${snippetHtml}`;
     }
 
-    function resultsHtml(results, pointLookup) {
+    function resultsHtml(results, pointLookup, useReranker) {
         const items = results.map(function (result) {
             const inSample = (pointLookup.get(String(result.article_index)) || []).length > 0;
-            return `<li>${resultHtml(result, inSample)}</li>`;
+            return `<li>${resultHtml(result, inSample, useReranker)}</li>`;
         });
-        return `Top 5:<ol class="faiss-results">${items.join("")}</ol>`;
+        const heading = useReranker ? "Top 5 after reranking:" : "Top 5 by FAISS:";
+        return `${heading}<ol class="faiss-results">${items.join("")}</ol>`;
     }
 
     graph.on("plotly_click", function (eventData) {
@@ -820,6 +849,12 @@ def build_faiss_search_script() -> str:
         }
     });
 
+    rerankerToggle.addEventListener("click", function () {
+        useReranker = !useReranker;
+        rerankerToggle.setAttribute("aria-pressed", useReranker ? "true" : "false");
+        rerankerToggle.textContent = useReranker ? "Reranker: on" : "Reranker: off";
+    });
+
     form.addEventListener("submit", async function (event) {
         event.preventDefault();
         const query = input.value.trim();
@@ -829,15 +864,20 @@ def build_faiss_search_script() -> str:
         }
 
         submitButton.disabled = true;
-        setStatus("Searching FAISS top 5...");
+        const searchMode = useReranker ? "Searching FAISS candidates and reranking..." : "Searching FAISS top 5...";
+        setStatus(searchMode);
         try {
-            const response = await fetch("/api/search?query=" + encodeURIComponent(query), {
+            const response = await fetch(
+                "/api/search?query=" + encodeURIComponent(query) + "&reranker=" + (useReranker ? "1" : "0"),
+                {
                 headers: {"Accept": "application/json"}
-            });
+                }
+            );
             if (!response.ok) {
                 throw new Error("HTTP " + response.status);
             }
             const payload = await response.json();
+            const responseUsedReranker = payload.use_reranker !== false;
             const results = payload.results || (payload.result ? [payload.result] : []);
             if (results.length === 0) {
                 await clearHighlights();
@@ -852,7 +892,9 @@ def build_faiss_search_script() -> str:
                 for (const match of matches) {
                     scoredMatches.push(Object.assign({}, match, {
                         rank: result.rank,
-                        score: result.score
+                        score: result.score,
+                        rerankerScore: result.reranker_score,
+                        useReranker: responseUsedReranker
                     }));
                 }
             }
@@ -862,9 +904,9 @@ def build_faiss_search_script() -> str:
             } else {
                 await clearHighlights();
             }
-            setStatus(resultsHtml(results, pointLookup), true);
+            setStatus(resultsHtml(results, pointLookup, responseUsedReranker), true);
         } catch (error) {
-            setStatus("FAISS endpoint ni dosegljiv. Zaženi: python src/serveUmapSearch.py");
+            setStatus("Search endpoint is not reachable. Start: python src/serveUmapSearch.py");
         } finally {
             submitButton.disabled = false;
         }

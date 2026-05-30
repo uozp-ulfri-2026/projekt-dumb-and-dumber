@@ -66,7 +66,13 @@ device      = auto
 
 ### 3. `src/faissSearch.py`
 
-Loads the embeddings and FAISS index, then runs a semantic search for a text query or a raw query embedding.
+Loads the embeddings and FAISS index, then runs semantic search. Text queries always use a two-stage retrieval flow:
+
+1. FAISS retrieves a larger candidate set.
+2. A cross-encoder reranker re-scores those candidates.
+3. The final `top-k` results are returned with the FAISS score and reranker score.
+
+Raw query embeddings can only use FAISS, because the reranker needs the original text query.
 
 Arguments:
 
@@ -84,8 +90,8 @@ index-path           = data/mmc_embeddings/faiss.index
 query                = none
 query-embedding      = none
 query-embedding-file = none
-reranker             = none
-rerank-top-k         = none
+reranker             = cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
+rerank-top-k         = 50
 top-k                = 5
 ```
 
@@ -93,17 +99,17 @@ Examples:
 
 ```powershell
 python src/faissSearch.py --query "Janja Garnbret" --top-k 10
-python src/faissSearch.py --query "doberdan" --reranker cross-encoder/ms-marco-MiniLM-L-6-v2 --rerank-top-k 50 --top-k 10
+python src/faissSearch.py --query "doberdan" --rerank-top-k 50 --top-k 10
 ```
 
 ### 4. `src/serveUmapSearch.py`
 
-Serves the Plotly UMAP HTML and exposes a FAISS-backed search endpoint at `/api/search`.
+Serves the Plotly UMAP HTML and exposes a FAISS + cross-encoder reranked search endpoint at `/api/search`.
 
 Arguments:
 
 ```powershell
-python src/serveUmapSearch.py [--host HOST] [--port PORT] [--embeddings PATH] [--metadata PATH] [--config PATH] [--index-path PATH] [--html PATH] [--rebuild-index] [--allow-model-download]
+python src/serveUmapSearch.py [--host HOST] [--port PORT] [--embeddings PATH] [--metadata PATH] [--config PATH] [--index-path PATH] [--html PATH] [--rebuild-index] [--allow-model-download] [--reranker MODEL] [--rerank-top-k N]
 ```
 
 Defaults:
@@ -118,9 +124,11 @@ index-path        = data/mmc_embeddings/faiss.index
 html              = data/mmc_embeddings/umap_visualization.html
 rebuild-index     = false
 allow-model-download = false
+reranker          = cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
+rerank-top-k      = 50
 ```
 
-Open `http://127.0.0.1:8000/` after starting the server.
+Open `http://127.0.0.1:8000/` after starting the server. The server loads the cross-encoder reranker at startup. In the visualization, the `Reranker` button lets you compare the default two-stage flow against FAISS-only search for an individual query.
 
 ### 5. `src/visualizeUmap.py`
 

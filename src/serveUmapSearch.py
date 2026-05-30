@@ -12,11 +12,24 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from sentence_transformers.cross_encoder import CrossEncoder
 
-from faissSearch import extract_top_sentences_for_article, load_metadata, load_or_build_index, search_top_k
+from faissSearch import (
+    DEFAULT_RERANK_TOP_K,
+    DEFAULT_RERANKER_MODEL,
+    extract_top_sentences_for_article,
+    load_metadata,
+    load_or_build_index,
+    rerank_results,
+    search_top_k,
+)
 
 
 LOGGER = logging.getLogger("serve_umap_search")
+
+
+def parse_bool(value: str) -> bool:
+    return str(value).strip().casefold() not in {"0", "false", "no", "off"}
 
 
 class FaissSearchService:
@@ -28,6 +41,8 @@ class FaissSearchService:
         index_path: Path,
         rebuild_index: bool,
         local_files_only: bool,
+        reranker_model_name: str,
+        rerank_top_k: int,
     ) -> None:
         LOGGER.info("Loading embeddings from %s", embeddings_path)
         self.embeddings = np.load(embeddings_path).astype(np.float32, copy=False)
@@ -62,46 +77,56 @@ class FaissSearchService:
         LOGGER.info("Loading query encoder '%s'", self.model_name)
         self.model = SentenceTransformer(self.model_name, local_files_only=local_files_only)
         self.model_lock = Lock()
+        self.local_files_only = local_files_only
+        self.reranker_model_name = reranker_model_name
+        self.rerank_top_k = rerank_top_k
 
-    def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+        LOGGER.info("Loading cross-encoder reranker '%s'", self.reranker_model_name)
+        try:
+            self.reranker = CrossEncoder(self.reranker_model_name, local_files_only=local_files_only)
+        except OSError as exc:
+            if local_files_only:
+                raise RuntimeError(
+                    "Cross-encoder reranker is not cached locally. Run once with "
+                    "`python src\\serveUmapSearch.py --allow-model-download` to download it, "
+                    "or pass --reranker with a locally cached cross-encoder model."
+                ) from exc
+            raise
+        self.reranker_lock = Lock()
+
+    def search(self, query: str, top_k: int = 5, use_reranker: bool = True) -> list[dict[str, Any]]:
         query = query.strip()
         if not query:
             return []
 
         with self.model_lock:
             query_embedding = self.model.encode(
-                [query],
+                [f"query: {query}"],
                 convert_to_numpy=True,
                 normalize_embeddings=self.normalized,
                 show_progress_bar=False,
             )
 
+        faiss_k = max(top_k, self.rerank_top_k) if use_reranker else top_k
         scores, indices = search_top_k(
             index=self.index,
             query_vector=np.asarray(query_embedding[0], dtype=np.float32),
-            top_k=top_k,
+            top_k=faiss_k,
             metric=self.metric,
             normalized=self.normalized,
         )
 
-        results: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
         for rank, (index, score) in enumerate(zip(indices, scores), start=1):
             if int(index) < 0:
                 continue
 
             article_index = int(index)
             article = self.metadata[article_index]
-            top_sentences = extract_top_sentences_for_article(
-                article_text=str(article.get("text", "") or ""),
-                query_vector=np.asarray(query_embedding[0], dtype=np.float32),
-                model_name=self.model_name,
-                top_k=3,
-                min_score=0.12,
-                model=self.model,
-            )
-            results.append(
+            candidates.append(
                 {
                     "rank": rank,
+                    "faiss_rank": rank,
                     "score": float(score),
                     "article_index": article_index,
                     "id": article.get("id"),
@@ -110,9 +135,35 @@ class FaissSearchService:
                     "date": article.get("date"),
                     "category": article.get("category"),
                     "keywords": article.get("keywords", []),
-                    "top_sentences": top_sentences,
+                    "text": article.get("text"),
                 }
             )
+
+        if use_reranker:
+            with self.reranker_lock:
+                results = rerank_results(
+                    query_text=query,
+                    candidates=candidates,
+                    reranker_model_name=self.reranker_model_name,
+                    reranker=self.reranker,
+                    local_files_only=self.local_files_only,
+                )
+        else:
+            results = candidates
+
+        results = results[:top_k]
+        for rank, result in enumerate(results, start=1):
+            result["rank"] = rank
+            top_sentences = extract_top_sentences_for_article(
+                article_text=str(result.get("text", "") or ""),
+                query_vector=np.asarray(query_embedding[0], dtype=np.float32),
+                model_name=self.model_name,
+                top_k=3,
+                min_score=0.12,
+                model=self.model,
+            )
+            result["top_sentences"] = top_sentences
+            result.pop("text", None)
         return results
 
 
@@ -133,6 +184,7 @@ class UmapSearchHandler(SimpleHTTPRequestHandler):
     def handle_search(self, query_string: str) -> None:
         params = parse_qs(query_string)
         query = (params.get("query") or params.get("q") or [""])[0].strip()
+        use_reranker = parse_bool((params.get("reranker") or params.get("use_reranker") or ["true"])[0])
         if not query:
             self.send_json({"error": "Missing query parameter."}, status=400)
             return
@@ -141,13 +193,20 @@ class UmapSearchHandler(SimpleHTTPRequestHandler):
             return
 
         try:
-            results = self.service.search(query, top_k=5)
+            results = self.service.search(query, top_k=5, use_reranker=use_reranker)
         except Exception as exc:  # pragma: no cover - visible through the browser.
             LOGGER.exception("Search failed")
             self.send_json({"error": str(exc)}, status=500)
             return
 
-        self.send_json({"query": query, "results": results, "result": results[0] if results else None})
+        self.send_json(
+            {
+                "query": query,
+                "use_reranker": use_reranker,
+                "results": results,
+                "result": results[0] if results else None,
+            }
+        )
 
     def send_json(self, payload: dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -160,7 +219,7 @@ class UmapSearchHandler(SimpleHTTPRequestHandler):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Serve the UMAP Plotly HTML with a FAISS top-5 search endpoint."
+        description="Serve the UMAP Plotly HTML with a FAISS + cross-encoder reranked search endpoint."
     )
     parser.add_argument(
         "--host",
@@ -213,6 +272,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow sentence-transformers to download model files if they are not cached locally.",
     )
+    parser.add_argument(
+        "--reranker",
+        type=str,
+        default=DEFAULT_RERANKER_MODEL,
+        help="Cross-encoder model name used to rerank FAISS candidates.",
+    )
+    parser.add_argument(
+        "--rerank-top-k",
+        type=int,
+        default=DEFAULT_RERANK_TOP_K,
+        help="Number of FAISS candidates to rerank before returning the top results.",
+    )
     return parser
 
 
@@ -222,6 +293,8 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
     args = build_parser().parse_args()
+    if args.rerank_top_k <= 0:
+        raise ValueError("--rerank-top-k must be greater than 0.")
 
     repo_root = Path.cwd().resolve()
     default_html_path = args.html.resolve()
@@ -237,6 +310,8 @@ def main() -> None:
         index_path=args.index_path,
         rebuild_index=args.rebuild_index,
         local_files_only=not args.allow_model_download,
+        reranker_model_name=args.reranker,
+        rerank_top_k=args.rerank_top_k,
     )
     UmapSearchHandler.default_html = default_html
 

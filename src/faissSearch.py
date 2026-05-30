@@ -20,6 +20,8 @@ except ImportError as exc:  # pragma: no cover
 
 
 LOGGER = logging.getLogger("faiss_search")
+DEFAULT_RERANKER_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+DEFAULT_RERANK_TOP_K = 50
 
 
 def load_metadata(path: Path) -> list[dict[str, Any]]:
@@ -134,14 +136,17 @@ def rerank_results(
     query_text: str,
     candidates: list[dict[str, Any]],
     reranker_model_name: str,
+    reranker: CrossEncoder | None = None,
+    local_files_only: bool = False,
 ) -> list[dict[str, Any]]:
     if not candidates or not query_text:
         return candidates
 
-    LOGGER.info("Loading cross-encoder reranker '%s'", reranker_model_name)
-    reranker = CrossEncoder(reranker_model_name)
+    if reranker is None:
+        LOGGER.info("Loading cross-encoder reranker '%s'", reranker_model_name)
+        reranker = CrossEncoder(reranker_model_name, local_files_only=local_files_only)
 
-    pairs = [[query_text, candidate["text"]] for candidate in candidates]
+    pairs = [[query_text, build_reranker_document_text(candidate)] for candidate in candidates]
     scores = reranker.predict(pairs)
 
     for candidate, score in zip(candidates, scores):
@@ -154,6 +159,22 @@ def rerank_results(
 
     LOGGER.info("Reranked %d candidates. Top: score=%.4f", len(reranked), reranked[0]["reranker_score"])
     return reranked
+
+
+def build_reranker_document_text(candidate: dict[str, Any]) -> str:
+    title = str(candidate.get("title") or "").strip()
+    text = str(candidate.get("text") or "").strip()
+    if not title:
+        return text
+    if not text:
+        return title
+
+    normalized_title = " ".join(title.casefold().split())
+    normalized_prefix = " ".join(text[: max(len(title) + 32, 128)].casefold().split())
+    if normalized_title and normalized_title in normalized_prefix:
+        return text
+
+    return f"title: {title}\n\n{text}"
 
 
 def search_top_k(
@@ -351,13 +372,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reranker",
         type=str,
-        default=None,
-        help="Optional cross-encoder model name for reranking the initial FAISS candidates.",
+        default=DEFAULT_RERANKER_MODEL,
+        help="Cross-encoder model name for reranking the initial FAISS candidates.",
     )
     parser.add_argument(
         "--rerank-top-k",
         type=int,
-        default=None,
+        default=DEFAULT_RERANK_TOP_K,
         help="Number of FAISS candidates to rerank before truncating to --top-k.",
     )
     parser.add_argument(
@@ -376,6 +397,10 @@ def main() -> None:
     )
 
     args = build_parser().parse_args()
+    if args.rerank_top_k <= 0:
+        raise ValueError("--rerank-top-k must be greater than 0.")
+    if args.top_k <= 0:
+        raise ValueError("--top-k must be greater than 0.")
 
     LOGGER.info("Loading embeddings from %s", args.embeddings)
     embeddings = np.load(args.embeddings).astype(np.float32, copy=False)
@@ -416,10 +441,10 @@ def main() -> None:
     else:
         query = load_query_embedding(args, expected_dim=embeddings.shape[1])
 
-    rerank_k = args.rerank_top_k if args.rerank_top_k is not None else args.top_k
-    faiss_k = max(args.top_k, rerank_k) if args.reranker else args.top_k
+    rerank_k = max(args.top_k, args.rerank_top_k)
+    faiss_k = rerank_k if args.query is not None else args.top_k
 
-    if args.reranker:
+    if args.query is not None:
         LOGGER.info(
             "Retrieving top %d results from FAISS (will rerank top %d)",
             faiss_k,
@@ -454,16 +479,15 @@ def main() -> None:
             }
         )
 
-    if args.reranker and args.query is not None:
+    if args.query is not None:
         candidates_to_rerank = results[:rerank_k]
         results = rerank_results(
             query_text=args.query,
             candidates=candidates_to_rerank,
             reranker_model_name=args.reranker,
         )
-    else:
-        if args.reranker and args.query is None:
-            LOGGER.warning("Reranker requested but no text query provided. Skipping reranking.")
+    elif args.reranker:
+        LOGGER.warning("Reranker needs a text query. Skipping reranking for raw query embedding input.")
 
     results = results[:args.top_k]
     # Add explanatory top sentences for the top result when a text query was provided
