@@ -1,5 +1,9 @@
 .venv
-data
+data/*
+!data/evaluation/
+data/evaluation/*
+!data/evaluation/*.md
+!data/evaluation/**/*.md
 src/__pycache__
 requirements.txt
 setup_venv_windows.ps1
