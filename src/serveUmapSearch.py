@@ -29,6 +29,8 @@ from faissSearch import (
 
 
 LOGGER = logging.getLogger("serve_umap_search")
+MAX_SEARCH_ARTICLES = 100
+DEFAULT_LOCAL_MAP_SIZE = 100
 
 
 def parse_bool(value: str) -> bool:
@@ -241,7 +243,8 @@ class FaissSearchService:
                 show_progress_bar=False,
             )
 
-        faiss_k = max(top_k, self.local_map_size, self.rerank_top_k if use_reranker else top_k)
+        requested_candidates = max(top_k, self.local_map_size, self.rerank_top_k if use_reranker else top_k)
+        faiss_k = min(MAX_SEARCH_ARTICLES, requested_candidates)
         scores, indices = search_top_k(
             index=self.index,
             query_vector=np.asarray(query_embedding[0], dtype=np.float32),
@@ -467,8 +470,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--local-map-size",
         type=int,
-        default=1000,
-        help="Number of FAISS candidates to project into the query-specific local map.",
+        default=DEFAULT_LOCAL_MAP_SIZE,
+        help="Number of FAISS candidates to project into the query-specific local map (max 100).",
     )
     parser.add_argument(
         "--local-cluster-count",
@@ -489,6 +492,9 @@ def main() -> None:
         raise ValueError("--rerank-top-k must be greater than 0.")
     if args.local_map_size <= 1:
         raise ValueError("--local-map-size must be greater than 1.")
+    if args.local_map_size > MAX_SEARCH_ARTICLES:
+        LOGGER.info("Capping --local-map-size from %d to %d.", args.local_map_size, MAX_SEARCH_ARTICLES)
+        args.local_map_size = MAX_SEARCH_ARTICLES
     if args.local_cluster_count < 2:
         raise ValueError("--local-cluster-count must be at least 2.")
 

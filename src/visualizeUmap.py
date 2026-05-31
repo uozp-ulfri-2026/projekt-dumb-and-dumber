@@ -54,6 +54,7 @@ def build_cache_key(
     umap_neighbors: int,
     umap_min_dist: float,
     n_clusters: int,
+    allow_parallelism: bool = False,
 ) -> str:
     parts = [
         str(embeddings_path.resolve()),
@@ -67,6 +68,7 @@ def build_cache_key(
         str(umap_neighbors),
         str(umap_min_dist),
         str(n_clusters),
+        str(allow_parallelism),
         "umap-v1",
     ]
     digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
@@ -85,6 +87,7 @@ def load_or_compute_projection(
     n_clusters: int,
     cache_dir: Path,
     force_recompute: bool,
+    allow_parallelism: bool = False,
 ) -> dict[str, Any]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_key = build_cache_key(
@@ -95,6 +98,7 @@ def load_or_compute_projection(
         umap_neighbors=umap_neighbors,
         umap_min_dist=umap_min_dist,
         n_clusters=n_clusters,
+        allow_parallelism=allow_parallelism,
     )
     cache_path = cache_dir / f"umap_{cache_key}.npz"
 
@@ -127,14 +131,19 @@ def load_or_compute_projection(
     effective_neighbors = min(umap_neighbors, max(2, len(indices) - 1))
     if effective_neighbors != umap_neighbors:
         LOGGER.info("Adjusted UMAP n_neighbors to %d for the sampled dataset size", effective_neighbors)
+    reducer_kwargs = {
+        "n_components": 2,
+        "metric": "cosine",
+        "n_neighbors": effective_neighbors,
+        "min_dist": umap_min_dist,
+    }
+    if allow_parallelism:
+        LOGGER.info("UMAP parallelism enabled; omitting random_state so n_jobs can use multiple cores.")
+        reducer_kwargs["n_jobs"] = -1
+    else:
+        reducer_kwargs["random_state"] = seed
 
-    reducer = umap.UMAP(
-        n_components=2,
-        metric="cosine",
-        n_neighbors=effective_neighbors,
-        min_dist=umap_min_dist,
-        random_state=seed,
-    )
+    reducer = umap.UMAP(**reducer_kwargs)
     coordinates = reducer.fit_transform(sample_embeddings).astype(np.float32, copy=False)
 
     np.savez_compressed(
@@ -1191,6 +1200,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of clusters to color code.",
     )
     parser.add_argument(
+        "--allow-parallelism",
+        action="store_true",
+        help="Allow UMAP to use multiple cores for faster projection (non-deterministic).",
+    )
+    parser.add_argument(
         "--force-recompute",
         action="store_true",
         help="Recompute the cached UMAP projection even if a cache exists.",
@@ -1232,6 +1246,7 @@ def main() -> None:
         n_clusters=cluster_count,
         cache_dir=args.cache_dir,
         force_recompute=args.force_recompute,
+        allow_parallelism=bool(args.allow_parallelism),
     )
 
     cluster_name_map = build_cluster_tfidf_labels(
