@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.cross_encoder import CrossEncoder
-from sklearn.cluster import KMeans
+from sklearn.cluster import AgglomerativeClustering
 from sklearn.decomposition import PCA
 from sklearn.feature_extraction.text import TfidfVectorizer
 
@@ -31,10 +31,61 @@ from faissSearch import (
 LOGGER = logging.getLogger("serve_umap_search")
 MAX_SEARCH_ARTICLES = 100
 DEFAULT_LOCAL_MAP_SIZE = 100
+LOCAL_CLUSTER_REDUCTION_DIM = 20
 
 
 def parse_bool(value: str) -> bool:
     return str(value).strip().casefold() not in {"0", "false", "no", "off"}
+
+
+def reduce_embeddings_for_clustering(embeddings: np.ndarray, target_dim: int = LOCAL_CLUSTER_REDUCTION_DIM) -> np.ndarray:
+    if embeddings.ndim != 2:
+        raise ValueError("Embeddings must be a 2D matrix [num_vectors, dim].")
+
+    if embeddings.shape[0] < 2 or embeddings.shape[1] < 2:
+        return embeddings.astype(np.float32, copy=False)
+
+    n_components = min(target_dim, embeddings.shape[1], max(1, embeddings.shape[0] - 1))
+    if n_components >= embeddings.shape[1]:
+        return embeddings.astype(np.float32, copy=False)
+
+    try:
+        import umap
+
+        reducer = umap.UMAP(
+            n_components=n_components,
+            metric="cosine",
+            n_neighbors=min(15, max(2, embeddings.shape[0] - 1)),
+            min_dist=0.0,
+            random_state=42,
+        )
+        return reducer.fit_transform(embeddings).astype(np.float32, copy=False)
+    except Exception:
+        LOGGER.exception("UMAP reduction to %d dims failed; falling back to PCA.", n_components)
+
+    reducer = PCA(n_components=n_components, random_state=42, svd_solver="randomized")
+    return reducer.fit_transform(embeddings).astype(np.float32, copy=False)
+
+
+def compute_agglomerative_labels(embeddings: np.ndarray, n_clusters: int) -> np.ndarray:
+    if embeddings.shape[0] < 2:
+        return np.full(embeddings.shape[0], -1, dtype=np.int32)
+
+    # Keep the local map coarse enough to read at a glance. With the 100-article cap,
+    # this yields roughly 2-7 clusters instead of fragmenting the view into many tiny groups.
+    effective_n_clusters = min(max(2, n_clusters), max(2, embeddings.shape[0] // 15))
+    if effective_n_clusters != n_clusters:
+        LOGGER.info(
+            "Adjusted local agglomerative cluster count to %d for the sampled dataset size",
+            effective_n_clusters,
+        )
+
+    cluster_model = AgglomerativeClustering(
+        n_clusters=effective_n_clusters,
+        linkage="average",
+        metric="cosine",
+    )
+    return cluster_model.fit_predict(embeddings).astype(np.int32, copy=False)
 
 
 def compute_local_coordinates(embeddings: np.ndarray) -> tuple[np.ndarray, str]:
@@ -315,9 +366,9 @@ class FaissSearchService:
 
         article_indices = np.asarray([int(candidate["article_index"]) for candidate in candidates], dtype=np.int64)
         local_embeddings = self.embeddings[article_indices].astype(np.float32, copy=False)
-        n_clusters = min(max(2, self.local_cluster_count), len(candidates))
-        cluster_labels = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto").fit_predict(local_embeddings)
-        coordinates, projection_method = compute_local_coordinates(local_embeddings)
+        reduced_embeddings = reduce_embeddings_for_clustering(local_embeddings)
+        cluster_labels = compute_agglomerative_labels(reduced_embeddings, n_clusters=self.local_cluster_count)
+        coordinates, projection_method = compute_local_coordinates(reduced_embeddings)
         cluster_names = build_local_cluster_labels(candidates=candidates, cluster_labels=cluster_labels)
         result_ranks = {int(result["article_index"]): int(result["rank"]) for result in results}
 
@@ -343,7 +394,8 @@ class FaissSearchService:
         return {
             "size": len(points),
             "projection": projection_method,
-            "cluster_count": int(n_clusters),
+            "cluster_count": int(len({int(label) for label in cluster_labels if int(label) >= 0})),
+            "cluster_reduction_dim": int(LOCAL_CLUSTER_REDUCTION_DIM),
             "points": points,
         }
 
@@ -477,7 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--local-cluster-count",
         type=int,
         default=12,
-        help="Number of KMeans clusters to compute inside each local map.",
+        help="Number of agglomerative clusters for the local map.",
     )
     return parser
 
