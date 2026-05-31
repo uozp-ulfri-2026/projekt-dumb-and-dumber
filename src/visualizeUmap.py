@@ -1196,7 +1196,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cluster-count",
         type=int,
-        default=50,
+        default=25,
         help="Maximum number of clusters to color code.",
     )
     parser.add_argument(
