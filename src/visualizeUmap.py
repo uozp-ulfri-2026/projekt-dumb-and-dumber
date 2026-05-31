@@ -406,7 +406,7 @@ def build_faiss_search_script() -> str:
         }
         .faiss-search-form {
             display: grid;
-            grid-template-columns: minmax(220px, 1fr) auto auto auto auto;
+            grid-template-columns: minmax(220px, 1fr) auto auto auto auto auto;
             gap: 8px;
             align-items: center;
         }
@@ -421,6 +421,7 @@ def build_faiss_search_script() -> str:
         .faiss-search-button,
         .faiss-reranker-toggle,
         .faiss-reset-button,
+        .faiss-local-reset-button,
         .faiss-clear-button {
             height: 38px;
             padding: 0 13px;
@@ -441,6 +442,7 @@ def build_faiss_search_script() -> str:
             color: #1f2937;
         }
         .faiss-reset-button,
+        .faiss-local-reset-button,
         .faiss-clear-button {
             border-color: #c9d1db;
             background: #ffffff;
@@ -449,6 +451,7 @@ def build_faiss_search_script() -> str:
         .faiss-search-button:disabled,
         .faiss-reranker-toggle:disabled,
         .faiss-reset-button:disabled,
+        .faiss-local-reset-button:disabled,
         .faiss-clear-button:disabled {
             cursor: progress;
             opacity: 0.72;
@@ -489,9 +492,33 @@ def build_faiss_search_script() -> str:
             color: #6b7280;
             font-size: 12px;
         }
+        .faiss-local-map-panel {
+            box-sizing: border-box;
+            width: min(1800px, calc(100vw - 32px));
+            margin: 8px auto 24px;
+            padding: 10px 0 0;
+            font-family: Arial, sans-serif;
+            color: #1f2937;
+            display: none;
+        }
+        .faiss-local-map-title {
+            margin: 0 0 8px;
+            font-size: 16px;
+            font-weight: 700;
+        }
+        .faiss-local-map-graph {
+            width: 100%;
+            height: 620px;
+            border: 1px solid #d8dee9;
+            border-radius: 8px;
+            background: #ffffff;
+        }
         @media (max-width: 720px) {
             .faiss-search-form {
                 grid-template-columns: 1fr;
+            }
+            .faiss-local-map-graph {
+                height: 520px;
             }
         }
     `;
@@ -505,20 +532,31 @@ def build_faiss_search_script() -> str:
             <input class="faiss-search-input" name="query" type="search" placeholder="FAISS + reranker search top 5..." autocomplete="off" />
             <button class="faiss-search-button" type="submit">Search</button>
             <button class="faiss-reranker-toggle" type="button" aria-pressed="true">Reranker: on</button>
-            <button class="faiss-reset-button" type="button">Reset view</button>
+            <button class="faiss-reset-button" type="button">Reset global view</button>
+            <button class="faiss-local-reset-button" type="button">Reset local view</button>
             <button class="faiss-clear-button" type="button">Reset</button>
         </form>
         <div class="faiss-search-status">${defaultStatus}</div>
     `;
     graph.parentNode.insertBefore(panel, graph);
+    const localPanel = document.createElement("section");
+    localPanel.className = "faiss-local-map-panel";
+    localPanel.innerHTML = `
+        <div class="faiss-local-map-title">Local map</div>
+        <div class="faiss-local-map-graph"></div>
+    `;
+    graph.parentNode.insertBefore(localPanel, graph.nextSibling);
 
     const form = panel.querySelector("form");
     const input = panel.querySelector(".faiss-search-input");
     const submitButton = panel.querySelector(".faiss-search-button");
     const rerankerToggle = panel.querySelector(".faiss-reranker-toggle");
     const resetButton = panel.querySelector(".faiss-reset-button");
+    const localResetButton = panel.querySelector(".faiss-local-reset-button");
     const clearButton = panel.querySelector(".faiss-clear-button");
     const status = panel.querySelector(".faiss-search-status");
+    const localTitle = localPanel.querySelector(".faiss-local-map-title");
+    const localGraph = localPanel.querySelector(".faiss-local-map-graph");
     let useReranker = true;
 
     function setStatus(message, isHtml) {
@@ -815,6 +853,148 @@ def build_faiss_search_script() -> str:
         return `${heading}<ol class="faiss-results">${items.join("")}</ol>`;
     }
 
+    function clearLocalMap() {
+        localPanel.style.display = "none";
+        if (localGraph && localGraph.data) {
+            Plotly.purge(localGraph);
+        }
+    }
+
+    function renderLocalMap(localMap, useReranker) {
+        if (!localMap || !Array.isArray(localMap.points) || localMap.points.length === 0) {
+            clearLocalMap();
+            return;
+        }
+
+        const grouped = new Map();
+        for (const point of localMap.points) {
+            const cluster = String(point.cluster || "Local cluster");
+            if (!grouped.has(cluster)) {
+                grouped.set(cluster, []);
+            }
+            grouped.get(cluster).push(point);
+        }
+
+        const traces = [];
+        const sortedGroups = Array.from(grouped.entries()).sort(function (left, right) {
+            return left[0].localeCompare(right[0], undefined, {numeric: true});
+        });
+        for (let groupIndex = 0; groupIndex < sortedGroups.length; groupIndex += 1) {
+            const groupName = sortedGroups[groupIndex][0];
+            const points = sortedGroups[groupIndex][1];
+            traces.push({
+                type: "scattergl",
+                mode: "markers",
+                name: groupName,
+                x: points.map(function (point) { return point.x; }),
+                y: points.map(function (point) { return point.y; }),
+                customdata: points.map(function (point) {
+                    return [
+                        point.title || "Brez naslova",
+                        point.category || "",
+                        point.date || "",
+                        point.url || "",
+                        point.faiss_rank,
+                        formatScore(point.score)
+                    ];
+                }),
+                hovertemplate: (
+                    "<b>%{customdata[0]}</b><br>"
+                    + "Topic: %{customdata[1]}<br>"
+                    + "Date: %{customdata[2]}<br>"
+                    + "FAISS rank: %{customdata[4]}<br>"
+                    + "FAISS score: %{customdata[5]}<br>"
+                    + "<extra></extra>"
+                ),
+                marker: {
+                    color: highlightColor(groupIndex + 1),
+                    size: 6,
+                    opacity: 0.62,
+                    line: {width: 0}
+                }
+            });
+        }
+
+        const resultPoints = localMap.points
+            .filter(function (point) {
+                return point.result_rank !== null
+                    && point.result_rank !== undefined
+                    && Number.isFinite(Number(point.result_rank));
+            })
+            .sort(function (left, right) { return Number(left.result_rank) - Number(right.result_rank); });
+        if (resultPoints.length > 0) {
+            traces.push({
+                type: "scatter",
+                mode: "markers+text",
+                name: useReranker ? "Reranked top 5" : "FAISS top 5",
+                x: resultPoints.map(function (point) { return point.x; }),
+                y: resultPoints.map(function (point) { return point.y; }),
+                text: resultPoints.map(function (point) { return String(point.result_rank); }),
+                textposition: "top center",
+                customdata: resultPoints.map(function (point) {
+                    return [
+                        point.title || "Brez naslova",
+                        point.category || "",
+                        point.date || "",
+                        point.url || "",
+                        point.faiss_rank,
+                        formatScore(point.score),
+                        point.result_rank
+                    ];
+                }),
+                hovertemplate: (
+                    "<b>%{customdata[0]}</b><br>"
+                    + "Final rank: %{customdata[6]}<br>"
+                    + "Topic: %{customdata[1]}<br>"
+                    + "Date: %{customdata[2]}<br>"
+                    + "FAISS rank: %{customdata[4]}<br>"
+                    + "FAISS score: %{customdata[5]}<br>"
+                    + "<extra></extra>"
+                ),
+                marker: {
+                    symbol: resultPoints.map(function (point) {
+                        return Number(point.result_rank) === 1 ? "star" : "square";
+                    }),
+                    size: resultPoints.map(function (point) {
+                        return Number(point.result_rank) === 1 ? 18 : 16;
+                    }),
+                    color: resultPoints.map(function (point) { return highlightColor(point.result_rank); }),
+                    line: {color: "#111827", width: 1}
+                }
+            });
+        }
+
+        localTitle.textContent = `Local map: top ${localMap.size} FAISS candidates (${String(localMap.projection || "projection").toUpperCase()})`;
+        localPanel.style.display = "block";
+        if (localGraph.data) {
+            Plotly.purge(localGraph);
+        }
+        Plotly.newPlot(
+            localGraph,
+            traces,
+            {
+                template: "plotly_white",
+                height: 620,
+                margin: {l: 42, r: 18, t: 24, b: 42},
+                xaxis: {title: "Local 1", zeroline: false},
+                yaxis: {title: "Local 2", zeroline: false},
+                legend: {orientation: "h"}
+            },
+            {displayModeBar: false, responsive: true}
+        );
+        localGraph.on("plotly_click", function (eventData) {
+            const point = eventData.points && eventData.points[0];
+            const custom = point && point.customdata;
+            if (!Array.isArray(custom) || !custom[3]) {
+                return;
+            }
+            const articleWindow = window.open(String(custom[3]), "_blank", "noopener,noreferrer");
+            if (articleWindow) {
+                articleWindow.opener = null;
+            }
+        });
+    }
+
     graph.on("plotly_click", function (eventData) {
         const point = eventData.points && eventData.points[0];
         if (!point || point.data && point.data.meta && point.data.meta.faissHighlight) {
@@ -881,6 +1061,7 @@ def build_faiss_search_script() -> str:
             const results = payload.results || (payload.result ? [payload.result] : []);
             if (results.length === 0) {
                 await clearHighlights();
+                clearLocalMap();
                 setStatus("Ni zadetka.");
                 return;
             }
@@ -904,6 +1085,7 @@ def build_faiss_search_script() -> str:
             } else {
                 await clearHighlights();
             }
+            renderLocalMap(payload.local_map, responseUsedReranker);
             setStatus(resultsHtml(results, pointLookup, responseUsedReranker), true);
         } catch (error) {
             setStatus("Search endpoint is not reachable. Start: python src/serveUmapSearch.py");
@@ -923,6 +1105,17 @@ def build_faiss_search_script() -> str:
         resetButton.disabled = false;
     });
 
+    localResetButton.addEventListener("click", async function () {
+        localResetButton.disabled = true;
+        if (localPanel.style.display !== "none" && localGraph.data) {
+            await Plotly.relayout(localGraph, {
+                "xaxis.autorange": true,
+                "yaxis.autorange": true
+            });
+        }
+        localResetButton.disabled = false;
+    });
+
     clearButton.addEventListener("click", async function () {
         clearButton.disabled = true;
         await clearHighlights();
@@ -934,6 +1127,7 @@ def build_faiss_search_script() -> str:
         });
         input.value = "";
         setStatus(defaultStatus);
+        clearLocalMap();
         clearButton.disabled = false;
     });
 }());

@@ -109,7 +109,7 @@ Serves the Plotly UMAP HTML and exposes a FAISS + cross-encoder reranked search 
 Arguments:
 
 ```powershell
-python src/serveUmapSearch.py [--host HOST] [--port PORT] [--embeddings PATH] [--metadata PATH] [--config PATH] [--index-path PATH] [--html PATH] [--rebuild-index] [--allow-model-download] [--reranker MODEL] [--rerank-top-k N]
+python src/serveUmapSearch.py [--host HOST] [--port PORT] [--embeddings PATH] [--metadata PATH] [--config PATH] [--index-path PATH] [--html PATH] [--rebuild-index] [--allow-model-download] [--reranker MODEL] [--rerank-top-k N] [--local-map-size N] [--local-cluster-count N]
 ```
 
 Defaults:
@@ -126,9 +126,11 @@ rebuild-index     = false
 allow-model-download = false
 reranker          = cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
 rerank-top-k      = 50
+local-map-size    = 1000
+local-cluster-count = 12
 ```
 
-Open `http://127.0.0.1:8000/` after starting the server. The server loads the cross-encoder reranker at startup. In the visualization, the `Reranker` button lets you compare the default two-stage flow against FAISS-only search for an individual query.
+Open `http://127.0.0.1:8000/` after starting the server. The server loads the cross-encoder reranker at startup. In the visualization, the `Reranker` button lets you compare the default two-stage flow against FAISS-only search for an individual query. After each search, a query-specific local map is drawn below the global UMAP panels from the top FAISS candidates, with the final top 5 highlighted.
 
 ### 5. `src/visualizeUmap.py`
 
