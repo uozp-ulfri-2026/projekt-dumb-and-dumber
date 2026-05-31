@@ -210,7 +210,8 @@ def _split_into_sentences(text: str) -> list[str]:
 
         keyword_match = re.match(r"^Ključne besede:\s*(.+)$", block, flags=re.IGNORECASE | re.DOTALL)
         if keyword_match:
-            return [f"Ključne besede: {keyword_match.group(1).strip()}"]
+            # Skip keyword blocks entirely so they are not treated as sentences
+            return []
 
         block = block.replace("\n", " ").strip()
 
