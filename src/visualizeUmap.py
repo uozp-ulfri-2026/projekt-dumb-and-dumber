@@ -4,7 +4,9 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,8 @@ import umap
 
 
 LOGGER = logging.getLogger("visualize_umap")
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_CACHE_PATH = Path("data") / "mmc_embeddings" / "gemini_global_label_cache.json"
 
 
 def load_metadata(path: Path) -> list[dict[str, Any]]:
@@ -267,6 +271,215 @@ def build_cluster_tfidf_labels(
         labels[cluster_id] = format_cluster_label(cluster_id, topic_label, top_words)
 
     return labels
+
+
+def _split_into_sentences(text: str) -> list[str]:
+    text = str(text or "").strip()
+    if not text:
+        return []
+    paragraphs = [part.strip() for part in re.split(r"\n{2,}", text) if part.strip()]
+    if not paragraphs:
+        paragraphs = [text]
+    sentences: list[str] = []
+    for paragraph in paragraphs:
+        paragraph = paragraph.replace("\n", " ").strip()
+        if not paragraph:
+            continue
+        parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", paragraph) if part.strip()]
+        sentences.extend(parts if parts else [paragraph])
+    return sentences
+
+
+def build_cluster_representative_topics(
+    metadata: list[dict[str, Any]],
+    sample_indices: np.ndarray,
+    cluster_labels: np.ndarray,
+    top_k_articles: int = 5,
+    sentences_per_article: int = 2,
+) -> dict[int, dict[str, Any]]:
+    cluster_ids = sorted(int(cluster_id) for cluster_id in np.unique(cluster_labels))
+    representatives: dict[int, dict[str, Any]] = {}
+
+    for cluster_id in cluster_ids:
+        row_indices = np.where(cluster_labels == cluster_id)[0]
+        if row_indices.size == 0:
+            continue
+
+        articles: list[dict[str, str]] = []
+        for row_index in row_indices[:top_k_articles]:
+            article = metadata[int(sample_indices[int(row_index)])]
+            title = str(article.get("title", "") or "").strip()
+            text = str(article.get("text", "") or "").strip()
+            keywords = article.get("keywords", [])
+            keyword_text = ", ".join(str(keyword) for keyword in keywords if isinstance(keyword, str))
+
+            if text:
+                snippet = " ".join(_split_into_sentences(text)[:sentences_per_article])
+            elif keyword_text:
+                snippet = keyword_text
+            else:
+                snippet = title
+
+            articles.append({"title": title, "snippet": snippet})
+
+        representatives[cluster_id] = {"articles": articles}
+
+    return representatives
+
+
+def _normalize_gemini_topic(value: str, max_words: int = 5) -> str:
+    value = " ".join(str(value or "").split()).strip()
+    if not value:
+        return "Neznano"
+    return " ".join(value.split()[:max_words])
+
+
+def _parse_json_from_text(text: str) -> Any | None:
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        match = re.search(r"(\[\s*\{.+\}\s*\])", text, flags=re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except Exception:
+                return None
+    return None
+
+
+def _parse_gemini_topics(parsed: Any) -> dict[int, str]:
+    topics: dict[int, str] = {}
+    if isinstance(parsed, dict) and "predictions" in parsed:
+        parsed = parsed["predictions"]
+    if not isinstance(parsed, list):
+        return topics
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        try:
+            cluster_id = int(item.get("cluster_id"))
+        except Exception:
+            continue
+        topic = str(item.get("topic") or item.get("label") or "").strip()
+        if topic:
+            topics[cluster_id] = _normalize_gemini_topic(topic)
+    return topics
+
+
+def _load_json_cache(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as source_file:
+            data = json.load(source_file)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        LOGGER.exception("Failed to load Gemini label cache from %s", path)
+    return {}
+
+
+def _save_json_cache(path: Path, cache: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as target_file:
+            json.dump(cache, target_file, ensure_ascii=False, indent=2)
+    except Exception:
+        LOGGER.exception("Failed to save Gemini label cache to %s", path)
+
+
+def build_gemini_cluster_labels(
+    metadata: list[dict[str, Any]],
+    sample_indices: np.ndarray,
+    cluster_labels: np.ndarray,
+    model_name: str,
+    cache_path: Path,
+    enable_gemini: bool,
+) -> dict[int, str] | None:
+    if not enable_gemini:
+        return None
+
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        LOGGER.warning("Gemini API key is not set; using TF-IDF labels for the global view.")
+        return None
+
+    representatives = build_cluster_representative_topics(metadata, sample_indices, cluster_labels)
+    if not representatives:
+        return None
+
+    cache_key_payload = json.dumps(
+        {
+            "model": model_name,
+            "clusters": representatives,
+            "sample_indices": sample_indices.tolist(),
+            "cluster_labels": cluster_labels.tolist(),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    cache_key = hashlib.sha256(cache_key_payload.encode("utf-8")).hexdigest()[:16]
+    cache = _load_json_cache(cache_path)
+    cached_entry = cache.get(cache_key)
+    if isinstance(cached_entry, list):
+        cached_topics = _parse_gemini_topics(cached_entry)
+        if cached_topics:
+            LOGGER.info("Gemini global label cache hit (%s).", cache_key)
+            return cached_topics
+
+    payload_blocks: list[str] = []
+    for cluster_id, info in representatives.items():
+        articles = info.get("articles", [])
+        lines = []
+        for article in articles:
+            title = str(article.get("title", "") or "").strip()
+            snippet = str(article.get("snippet", "") or "").strip()
+            if title and snippet:
+                lines.append(f"- {title}: {snippet}")
+            elif title:
+                lines.append(f"- {title}")
+        payload_blocks.append(f"Skupina {cluster_id}:\n" + "\n".join(lines))
+
+    prompt = (
+        "Imas skupine novicarskih clankov o slovenskih aktualnih dogodkih. "
+        "Za vsako skupino vrni ENO temo v SLOVENSCINI, dolgo NAJVEC 5 besed. "
+        "Ne vracaj stavkov, razlag ali dveh delov. Vrni samo temo. "
+        "Vrni IZKLJUCNO JSON polje objektov s kljuci: cluster_id (integer), topic (string). "
+        "Brez dodatnega besedila. Primeri skupin so spodaj.\n\n"
+        + "\n\n".join(payload_blocks)
+        + "\n\nVrni JSON kot: [{\"cluster_id\": 0, \"topic\": \"vpis v srednje sole\"}, ...]"
+    )
+
+    try:
+        from google import genai
+
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config={"temperature": 0.2, "response_mime_type": "application/json"},
+        )
+        parsed = _parse_json_from_text((getattr(response, "text", "") or "").strip())
+        topics = _parse_gemini_topics(parsed)
+        if not topics:
+            LOGGER.warning("Gemini returned unparsable global labels; using TF-IDF labels.")
+            return None
+
+        cache[cache_key] = [
+            {"cluster_id": int(cluster_id), "topic": topic}
+            for cluster_id, topic in sorted(topics.items(), key=lambda item: item[0])
+        ]
+        _save_json_cache(cache_path, cache)
+        return topics
+    except Exception as exc:
+        message = str(exc)
+        if "RESOURCE_EXHAUSTED" in message or "quota" in message.lower() or "429" in message:
+            LOGGER.warning("Gemini quota exhausted for the global view; using TF-IDF labels.")
+        else:
+            LOGGER.exception("Gemini global label request failed")
+        return None
 
 
 def format_cluster_label(
@@ -1205,6 +1418,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow UMAP to use multiple cores for faster projection (non-deterministic).",
     )
     parser.add_argument(
+        "--disable-global-labeling",
+        action="store_true",
+        help="Disable Gemini-based automatic labeling for the global view and use TF-IDF labels only.",
+    )
+    parser.add_argument(
+        "--gemini-model",
+        type=str,
+        default=DEFAULT_GEMINI_MODEL,
+        help="Gemini model name for global labeling (default: gemini-2.5-flash).",
+    )
+    parser.add_argument(
+        "--gemini-cache-path",
+        type=Path,
+        default=DEFAULT_GEMINI_CACHE_PATH,
+        help="Path to the persistent JSON cache file for global Gemini labels.",
+    )
+    parser.add_argument(
         "--force-recompute",
         action="store_true",
         help="Recompute the cached UMAP projection even if a cache exists.",
@@ -1249,12 +1479,24 @@ def main() -> None:
         allow_parallelism=bool(args.allow_parallelism),
     )
 
-    cluster_name_map = build_cluster_tfidf_labels(
+    cluster_name_map = build_gemini_cluster_labels(
         metadata=metadata,
         sample_indices=projection["sample_indices"],
         cluster_labels=projection["cluster_labels"],
-        top_k_words=5,
+        model_name=args.gemini_model,
+        cache_path=args.gemini_cache_path,
+        enable_gemini=not args.disable_global_labeling,
     )
+    if not cluster_name_map:
+        cluster_name_map = build_cluster_tfidf_labels(
+            metadata=metadata,
+            sample_indices=projection["sample_indices"],
+            cluster_labels=projection["cluster_labels"],
+            top_k_words=5,
+        )
+        LOGGER.info("Using TF-IDF labels for the global view.")
+    else:
+        LOGGER.info("Using Gemini labels for the global view.")
 
     plot_rows = build_plot_data(
         metadata=metadata,

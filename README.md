@@ -106,10 +106,12 @@ python src/faissSearch.py --query "doberdan" --rerank-top-k 50 --top-k 10
 
 Serves the Plotly UMAP HTML and exposes a FAISS + cross-encoder reranked search endpoint at `/api/search`.
 
+The query-specific local map can also receive Gemini-generated cluster topics. That API call happens only when a user submits a search request and only if local auto-labeling is enabled.
+
 Arguments:
 
 ```powershell
-python src/serveUmapSearch.py [--host HOST] [--port PORT] [--embeddings PATH] [--metadata PATH] [--config PATH] [--index-path PATH] [--html PATH] [--rebuild-index] [--allow-model-download] [--reranker MODEL] [--rerank-top-k N] [--local-map-size N] [--local-cluster-count N]
+python src/serveUmapSearch.py [--host HOST] [--port PORT] [--embeddings PATH] [--metadata PATH] [--config PATH] [--index-path PATH] [--html PATH] [--rebuild-index] [--allow-model-download] [--reranker MODEL] [--rerank-top-k N] [--local-map-size N] [--local-cluster-count N] [--disable-auto-labeling] [--gemini-model MODEL] [--gemini-cache-path PATH]
 ```
 
 Defaults:
@@ -126,20 +128,32 @@ rebuild-index     = false
 allow-model-download = false
 reranker          = cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
 rerank-top-k      = 50
-local-map-size    = 1000
+local-map-size    = 100
 local-cluster-count = 12
+disable-auto-labeling = false
+gemini-model      = gemini-2.5-flash
+gemini-cache-path = data/mmc_embeddings/gemini_label_cache.json
 ```
 
 Open `http://127.0.0.1:8000/` after starting the server. The server loads the cross-encoder reranker at startup. In the visualization, the `Reranker` button lets you compare the default two-stage flow against FAISS-only search for an individual query. After each search, a query-specific local map is drawn below the global UMAP panels from the top FAISS candidates, with the final top 5 highlighted.
+
+Local Gemini labeling details:
+
+- The Gemini API is called only after a search request reaches `/api/search` and the local map is being built.
+- It is not called during server startup.
+- If `--disable-auto-labeling` is set, the local view uses TF-IDF labels only.
+- Labels are cached on disk, so repeated searches with the same local-map setup reuse the saved JSON cache instead of calling Gemini again.
 
 ### 5. `src/visualizeUmap.py`
 
 Builds the interactive UMAP visualization and caches the projection for reuse.
 
+The global cluster labels can also come from Gemini. That API call happens only when you run the build script, not when the saved HTML is later served. The generated labels are cached on disk and reused across future builds when the sample and parameters are unchanged.
+
 Arguments:
 
 ```powershell
-python src/visualizeUmap.py [--embeddings PATH] [--metadata PATH] [--output-html PATH] [--cache-dir PATH] [--sample-size N] [--seed N] [--umap-neighbors N] [--umap-min-dist FLOAT] [--cluster-count N] [--force-recompute]
+python src/visualizeUmap.py [--embeddings PATH] [--metadata PATH] [--output-html PATH] [--cache-dir PATH] [--sample-size N] [--seed N] [--umap-neighbors N] [--umap-min-dist FLOAT] [--cluster-count N] [--allow-parallelism] [--disable-global-labeling] [--gemini-model MODEL] [--gemini-cache-path PATH] [--force-recompute]
 ```
 
 Defaults:
@@ -153,9 +167,27 @@ sample-size     = 73363
 seed            = 42
 umap-neighbors  = 30
 umap-min-dist   = 0.08
-cluster-count   = 50
+cluster-count   = 25
+allow-parallelism = false
+disable-global-labeling = false
+gemini-model    = gemini-2.5-flash
+gemini-cache-path = data/mmc_embeddings/gemini_global_label_cache.json
 force-recompute = false
 ```
+
+Global Gemini labeling details:
+
+- The Gemini API is called only while generating the HTML in `src/visualizeUmap.py`.
+- It is not called by the static HTML viewer or by the search server.
+- If `--disable-global-labeling` is set, the global view uses TF-IDF labels only.
+- The label cache is stored on disk, so later builds can reuse it without another API call.
+- `--force-recompute` only rebuilds the UMAP projection cache; it does not automatically delete the Gemini label cache.
+
+Keeping the visualization between runs:
+
+- If you do not run `src/visualizeUmap.py` again, the existing `umap_visualization.html` remains unchanged.
+- If you run `src/visualizeUmap.py` again with the same inputs and parameters, it reuses the cached projection and cached Gemini labels unless you change the sample, parameters, or cache path.
+- If you want only to serve the already-built visualization, run `src/serveUmapSearch.py` and keep the generated HTML in place.
 
 ### 6. `src/silhouetteAnalysis.py`
 

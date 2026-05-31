@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import os
+import re
+import time
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -11,6 +15,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
+import requests
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.cross_encoder import CrossEncoder
 from sklearn.cluster import AgglomerativeClustering
@@ -32,6 +37,8 @@ LOGGER = logging.getLogger("serve_umap_search")
 MAX_SEARCH_ARTICLES = 100
 DEFAULT_LOCAL_MAP_SIZE = 100
 LOCAL_CLUSTER_REDUCTION_DIM = 20
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_CACHE_PATH = Path("data") / "mmc_embeddings" / "gemini_label_cache.json"
 
 
 def parse_bool(value: str) -> bool:
@@ -150,7 +157,7 @@ def build_local_cluster_labels(
 
     if not grouped_docs or not any(doc.strip() for doc in grouped_docs):
         return {
-            cluster_id: format_cluster_label(cluster_id, dominant_topics.get(cluster_id, "Uncategorized"), [])
+            cluster_id: dominant_topics.get(cluster_id, "Uncategorized")
             for cluster_id in cluster_ids
         }
 
@@ -167,7 +174,7 @@ def build_local_cluster_labels(
         feature_names = vectorizer.get_feature_names_out()
     except ValueError:
         return {
-            cluster_id: format_cluster_label(cluster_id, dominant_topics.get(cluster_id, "Uncategorized"), [])
+            cluster_id: dominant_topics.get(cluster_id, "Uncategorized")
             for cluster_id in cluster_ids
         }
 
@@ -176,13 +183,13 @@ def build_local_cluster_labels(
         row = tfidf_matrix.getrow(row_pos)
         topic_label = dominant_topics.get(cluster_id, "Uncategorized")
         if row.nnz == 0:
-            labels[cluster_id] = format_cluster_label(cluster_id, topic_label, [])
+            labels[cluster_id] = topic_label
             continue
 
         weights = row.toarray().ravel()
         top_indices = np.argsort(weights)[::-1][:top_k_words]
         top_words = [feature_names[index] for index in top_indices if weights[index] > 0]
-        labels[cluster_id] = format_cluster_label(cluster_id, topic_label, top_words)
+        labels[cluster_id] = topic_label
 
     return labels
 
@@ -228,6 +235,9 @@ class FaissSearchService:
         rerank_top_k: int,
         local_map_size: int,
         local_cluster_count: int,
+        enable_auto_labeling: bool,
+        gemini_model: str,
+        gemini_cache_path: Path,
     ) -> None:
         LOGGER.info("Loading embeddings from %s", embeddings_path)
         self.embeddings = np.load(embeddings_path).astype(np.float32, copy=False)
@@ -267,6 +277,12 @@ class FaissSearchService:
         self.rerank_top_k = rerank_top_k
         self.local_map_size = local_map_size
         self.local_cluster_count = local_cluster_count
+        self.enable_auto_labeling = enable_auto_labeling
+        self.gemini_model = gemini_model
+        self.gemini_cache_path = gemini_cache_path
+        self.gemini_cache_lock = Lock()
+        self.gemini_cache = self._load_gemini_cache()
+        self.gemini_retry_after_epoch = 0.0
 
         LOGGER.info("Loading cross-encoder reranker '%s'", self.reranker_model_name)
         try:
@@ -369,7 +385,25 @@ class FaissSearchService:
         reduced_embeddings = reduce_embeddings_for_clustering(local_embeddings)
         cluster_labels = compute_agglomerative_labels(reduced_embeddings, n_clusters=self.local_cluster_count)
         coordinates, projection_method = compute_local_coordinates(reduced_embeddings)
+        # First produce TF-IDF based labels (fast fallback)
         cluster_names = build_local_cluster_labels(candidates=candidates, cluster_labels=cluster_labels)
+
+        # Attempt to label clusters using a Gemini LLM (batch). If the environment
+        # is not configured or the call fails, we silently fall back to TF-IDF labels.
+        if self.enable_auto_labeling:
+            try:
+                gemini_labels = self._label_clusters_with_gemini(
+                    candidates=candidates,
+                    cluster_labels=cluster_labels,
+                    local_embeddings=local_embeddings,
+                    reduced_embeddings=reduced_embeddings,
+                    top_k=5,
+                )
+                if gemini_labels:
+                    for cid, topic in gemini_labels.items():
+                        cluster_names[int(cid)] = topic
+            except Exception:
+                LOGGER.exception("Gemini labeling failed; using TF-IDF labels.")
         result_ranks = {int(result["article_index"]): int(result["rank"]) for result in results}
 
         points: list[dict[str, Any]] = []
@@ -379,7 +413,7 @@ class FaissSearchService:
                 {
                     "x": float(coordinates[row, 0]),
                     "y": float(coordinates[row, 1]),
-                    "cluster": cluster_names.get(int(cluster_labels[row]), f"C{int(cluster_labels[row]) + 1:02d}"),
+                    "cluster": cluster_names.get(int(cluster_labels[row]), "Uncategorized"),
                     "article_index": article_index,
                     "faiss_rank": int(candidate["faiss_rank"]),
                     "score": float(candidate["score"]),
@@ -398,6 +432,325 @@ class FaissSearchService:
             "cluster_reduction_dim": int(LOCAL_CLUSTER_REDUCTION_DIM),
             "points": points,
         }
+
+    def _label_clusters_with_gemini(
+        self,
+        candidates: list[dict[str, Any]],
+        cluster_labels: np.ndarray,
+        local_embeddings: np.ndarray,
+        reduced_embeddings: np.ndarray,
+        top_k: int = 5,
+        timeout: int = 15,
+    ) -> dict[int, str] | None:
+        """Ask a Gemini-compatible LLM to produce one short Slovenian topic
+        label (max 5 words) for each cluster. Returns a mapping cluster_id -> topic
+        or None on early exit.
+
+        Configuration (Google AI Studio preferred):
+        - GEMINI_API_KEY: API key from Google AI Studio
+        - GEMINI_MODEL: optional override (otherwise --gemini-model / default)
+
+        Compatibility mode (optional):
+        - GEMINI_API_URL: if set, fallback to raw HTTP POST endpoint with bearer auth
+        """
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return None
+
+        if time.time() < self.gemini_retry_after_epoch:
+            wait_seconds = int(self.gemini_retry_after_epoch - time.time())
+            LOGGER.info("Skipping Gemini labeling due to active backoff (%ds remaining).", max(0, wait_seconds))
+            return None
+
+        # Build representative examples per cluster using nearest-to-centroid articles
+        cluster_ids = sorted(int(cid) for cid in np.unique(cluster_labels))
+        payload_blocks: list[str] = []
+        cache_clusters: list[dict[str, Any]] = []
+
+        for cid in cluster_ids:
+            rows = np.where(cluster_labels == cid)[0]
+            if rows.size == 0:
+                continue
+
+            # Centroid in reduced space
+            centroid_red = np.mean(reduced_embeddings[rows], axis=0)
+            # Compute cosine similarity of members to centroid to pick representatives
+            cent_norm = centroid_red / (np.linalg.norm(centroid_red) + 1e-12)
+            member_red = reduced_embeddings[rows]
+            sims = member_red.dot(cent_norm)
+            order = np.argsort(sims)[::-1][: top_k]
+            examples: list[str] = []
+
+            # For summarization query vector use mean of original embeddings for cluster
+            centroid_full = np.mean(local_embeddings[rows], axis=0)
+
+            for pos in order:
+                idx = int(rows[int(pos)])
+                cand = candidates[int(idx)]
+                title = str(cand.get("title") or "").strip()
+                text = str(cand.get("text") or "").strip()
+                snippet = ""
+                if text:
+                    try:
+                        sents = extract_top_sentences_for_article(
+                            article_text=text,
+                            query_vector=centroid_full,
+                            model_name=self.model_name,
+                            top_k=2,
+                            min_score=0.05,
+                            model=self.model,
+                        )
+                        if sents:
+                            snippet = " ".join(s.get("sentence", "") for s in sents)
+                    except Exception:
+                        LOGGER.debug("Failed to extract top sentences for candidate %s", cand.get("id"), exc_info=True)
+                if not snippet and text:
+                    snippet = " ".join(part.strip() for part in re.split(r"(?<=[.!?])\\s+", text)[:2] if part.strip())
+                if not snippet and title:
+                    snippet = title
+
+                example_line = f"- {title}: {snippet}" if snippet else f"- {title}"
+                examples.append(example_line)
+
+            block = f"Cluster {cid} representative articles:\n" + "\n".join(examples)
+            payload_blocks.append(block)
+            cache_clusters.append({"cluster_id": cid, "examples": examples})
+
+        if not payload_blocks:
+            return None
+
+        model_name = os.environ.get("GEMINI_MODEL", self.gemini_model)
+        cache_key = self._build_gemini_cache_key(model_name=model_name, cache_clusters=cache_clusters)
+        cached = self._get_cached_gemini_labels(cache_key)
+        if cached:
+            return cached
+
+        # Build a clear instruction that forces strict JSON output.
+        prompt = (
+            "Imas skupine novicarskih clankov o slovenskih aktualnih dogodkih. "
+            "Za vsako skupino vrni ENO temo v SLOVENSCINI, dolgo NAJVEC 5 besed. "
+            "Ne vracaj stavkov, razlag ali dveh delov. Vrni samo temo. "
+            "Vrni IZKLJUCNO JSON polje objektov s kljuci: cluster_id (integer), topic (string). "
+            "Brez dodatnega besedila. Primeri skupin so spodaj.\n\n"
+            + "\n\n".join(payload_blocks)
+            + "\n\nVrni JSON kot: [{\"cluster_id\": 0, \"topic\": \"vpis v srednje sole\"}, ...]"
+        )
+
+        parsed = self._query_gemini(prompt=prompt, api_key=api_key, model_name=model_name, timeout=timeout)
+        if parsed is None:
+            return None
+
+        out = self._parse_gemini_cluster_labels(parsed)
+        if not out:
+            return None
+        self._set_cached_gemini_labels(cache_key, out)
+        return out
+
+    def _query_gemini(self, prompt: str, api_key: str, model_name: str, timeout: int) -> Any | None:
+        api_url = os.environ.get("GEMINI_API_URL", "").strip()
+
+        # Preferred path: Google AI Studio SDK
+        if not api_url:
+            try:
+                # New Google AI Studio SDK path (preferred)
+                from google import genai
+
+                client = genai.Client(api_key=api_key)
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config={
+                        "temperature": 0.2,
+                        "response_mime_type": "application/json",
+                    },
+                )
+                text = (getattr(response, "text", "") or "").strip()
+                if not text:
+                    LOGGER.warning("Gemini SDK returned empty text response.")
+                    return None
+                return self._parse_json_from_text(text)
+            except ImportError:
+                # Backward-compatible legacy SDK fallback.
+                try:
+                    import google.generativeai as genai_legacy
+
+                    genai_legacy.configure(api_key=api_key)
+                    model = genai_legacy.GenerativeModel(model_name)
+                    response = model.generate_content(
+                        prompt,
+                        generation_config={
+                            "temperature": 0.2,
+                            "response_mime_type": "application/json",
+                        },
+                    )
+                    text = (getattr(response, "text", "") or "").strip()
+                    if not text:
+                        LOGGER.warning("Legacy Gemini SDK returned empty text response.")
+                        return None
+                    return self._parse_json_from_text(text)
+                except ImportError:
+                    LOGGER.warning(
+                        "Neither google.genai nor google-generativeai is installed. "
+                        "Install `google-genai` or set GEMINI_API_URL for HTTP mode."
+                    )
+                    return None
+                except Exception as exc:
+                    self._handle_gemini_failure(exc)
+                    return None
+            except Exception:
+                self._handle_gemini_failure()
+                return None
+
+        # Compatibility path: custom HTTP endpoint with bearer token
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        body = {"prompt": prompt, "max_output_tokens": 256}
+        try:
+            resp = requests.post(api_url, headers=headers, json=body, timeout=timeout)
+            resp.raise_for_status()
+            return self._parse_json_from_text(resp.text.strip())
+        except Exception:
+            self._handle_gemini_failure()
+            return None
+
+    def _handle_gemini_failure(self, exc: Exception | None = None) -> None:
+        message = ""
+        if exc is not None:
+            message = str(exc)
+
+        # Detect quota / resource exhausted errors and respect suggested retry delay.
+        is_quota_error = "RESOURCE_EXHAUSTED" in message or "quota" in message.lower() or "429" in message
+        if is_quota_error:
+            retry_seconds = self._extract_retry_seconds(message)
+            # Apply a minimum backoff to avoid repeated token burn and noisy logs.
+            retry_seconds = max(60, retry_seconds)
+            self.gemini_retry_after_epoch = time.time() + retry_seconds
+            LOGGER.warning(
+                "Gemini quota/backoff triggered; disabling Gemini labeling for %ds. "
+                "Use --disable-auto-labeling to suppress all Gemini calls while testing.",
+                retry_seconds,
+            )
+            return
+
+        if exc is not None:
+            LOGGER.exception("Gemini SDK/API request failed")
+        else:
+            LOGGER.exception("Gemini SDK/API request failed")
+
+    def _extract_retry_seconds(self, error_text: str) -> int:
+        if not error_text:
+            return 60
+        # Examples: "Please retry in 45.525465468s." or "retry_delay { seconds: 45 }"
+        match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", error_text, flags=re.IGNORECASE)
+        if match:
+            try:
+                return int(float(match.group(1)))
+            except Exception:
+                pass
+        match = re.search(r"seconds:\s*([0-9]+)", error_text)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                pass
+        return 60
+
+    def _parse_json_from_text(self, text: str) -> Any | None:
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            match = re.search(r"(\[\s*\{.+\}\s*\])", text, flags=re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(1))
+                except Exception:
+                    return None
+        return None
+
+    def _parse_gemini_cluster_labels(self, parsed: Any) -> dict[int, str]:
+        out: dict[int, str] = {}
+        if isinstance(parsed, dict) and "predictions" in parsed:
+            parsed = parsed["predictions"]
+
+        if not isinstance(parsed, list):
+            LOGGER.warning("Unexpected Gemini response structure: %s", type(parsed))
+            return out
+
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            try:
+                cid = int(item.get("cluster_id"))
+            except Exception:
+                continue
+            topic = str(item.get("topic") or item.get("label") or "").strip()
+            if topic:
+                # Keep only first 5 words to enforce UI-compatible compact topics.
+                topic = " ".join(topic.split()[:5])
+                out[cid] = topic
+        return out
+
+    def _build_gemini_cache_key(self, model_name: str, cache_clusters: list[dict[str, Any]]) -> str:
+        canonical = json.dumps(
+            {
+                "model": model_name,
+                "clusters": sorted(cache_clusters, key=lambda item: int(item.get("cluster_id", -1))),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return hashlib.sha1(canonical.encode("utf-8")).hexdigest()
+
+    def _load_gemini_cache(self) -> dict[str, Any]:
+        if not self.gemini_cache_path.exists():
+            return {}
+        try:
+            with self.gemini_cache_path.open("r", encoding="utf-8") as source_file:
+                data = json.load(source_file)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            LOGGER.exception("Failed to load Gemini label cache from %s", self.gemini_cache_path)
+        return {}
+
+    def _save_gemini_cache(self) -> None:
+        try:
+            self.gemini_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.gemini_cache_path.open("w", encoding="utf-8") as target_file:
+                json.dump(self.gemini_cache, target_file, ensure_ascii=False, indent=2)
+        except Exception:
+            LOGGER.exception("Failed to save Gemini label cache to %s", self.gemini_cache_path)
+
+    def _get_cached_gemini_labels(self, cache_key: str) -> dict[int, str] | None:
+        with self.gemini_cache_lock:
+            entry = self.gemini_cache.get(cache_key)
+        if not isinstance(entry, list):
+            return None
+        out: dict[int, str] = {}
+        for item in entry:
+            if not isinstance(item, dict):
+                continue
+            try:
+                cid = int(item.get("cluster_id"))
+                topic = str(item.get("topic") or item.get("label") or "").strip()
+                if topic:
+                    out[cid] = " ".join(topic.split()[:5])
+            except Exception:
+                continue
+        if out:
+            LOGGER.info("Gemini label cache hit (%s).", cache_key[:10])
+            return out
+        return None
+
+    def _set_cached_gemini_labels(self, cache_key: str, labels: dict[int, str]) -> None:
+        serializable = [
+            {"cluster_id": int(cid), "topic": " ".join(str(topic).split()[:5])}
+            for cid, topic in sorted(labels.items(), key=lambda item: item[0])
+        ]
+        with self.gemini_cache_lock:
+            self.gemini_cache[cache_key] = serializable
+            self._save_gemini_cache()
 
 
 class UmapSearchHandler(SimpleHTTPRequestHandler):
@@ -531,6 +884,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=12,
         help="Number of agglomerative clusters for the local map.",
     )
+    parser.add_argument(
+        "--disable-auto-labeling",
+        action="store_true",
+        help="Disable Gemini-based automatic cluster labeling (uses TF-IDF labels only).",
+    )
+    parser.add_argument(
+        "--gemini-model",
+        type=str,
+        default=DEFAULT_GEMINI_MODEL,
+        help="Gemini model name used for AI Studio labeling (e.g. gemini-2.0-flash-lite).",
+    )
+    parser.add_argument(
+        "--gemini-cache-path",
+        type=Path,
+        default=DEFAULT_GEMINI_CACHE_PATH,
+        help="Path to JSON cache file for Gemini cluster labels.",
+    )
     return parser
 
 
@@ -568,6 +938,9 @@ def main() -> None:
         rerank_top_k=args.rerank_top_k,
         local_map_size=args.local_map_size,
         local_cluster_count=args.local_cluster_count,
+        enable_auto_labeling=not args.disable_auto_labeling,
+        gemini_model=args.gemini_model,
+        gemini_cache_path=args.gemini_cache_path,
     )
     UmapSearchHandler.default_html = default_html
 
