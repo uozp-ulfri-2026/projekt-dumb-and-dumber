@@ -312,10 +312,9 @@ class FaissSearchService:
 
         article_indices = np.asarray([int(candidate["article_index"]) for candidate in candidates], dtype=np.int64)
         local_embeddings = self.embeddings[article_indices].astype(np.float32, copy=False)
-        coordinates, projection_method = compute_local_coordinates(local_embeddings)
-
         n_clusters = min(max(2, self.local_cluster_count), len(candidates))
         cluster_labels = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto").fit_predict(local_embeddings)
+        coordinates, projection_method = compute_local_coordinates(local_embeddings)
         cluster_names = build_local_cluster_labels(candidates=candidates, cluster_labels=cluster_labels)
         result_ranks = {int(result["article_index"]): int(result["rank"]) for result in results}
 

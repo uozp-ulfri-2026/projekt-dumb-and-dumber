@@ -494,7 +494,7 @@ def build_faiss_search_script() -> str:
         }
         .faiss-local-map-panel {
             box-sizing: border-box;
-            width: min(1800px, calc(100vw - 32px));
+            width: min(900px, calc(100vw - 32px));
             margin: 8px auto 24px;
             padding: 10px 0 0;
             font-family: Arial, sans-serif;
@@ -508,7 +508,7 @@ def build_faiss_search_script() -> str:
         }
         .faiss-local-map-graph {
             width: 100%;
-            height: 620px;
+            height: 520px;
             border: 1px solid #d8dee9;
             border-radius: 8px;
             background: #ffffff;
@@ -518,7 +518,7 @@ def build_faiss_search_script() -> str:
                 grid-template-columns: 1fr;
             }
             .faiss-local-map-graph {
-                height: 520px;
+                height: 460px;
             }
         }
     `;
@@ -925,12 +925,10 @@ def build_faiss_search_script() -> str:
         if (resultPoints.length > 0) {
             traces.push({
                 type: "scatter",
-                mode: "markers+text",
+                mode: "markers",
                 name: useReranker ? "Reranked top 5" : "FAISS top 5",
                 x: resultPoints.map(function (point) { return point.x; }),
                 y: resultPoints.map(function (point) { return point.y; }),
-                text: resultPoints.map(function (point) { return String(point.result_rank); }),
-                textposition: "top center",
                 customdata: resultPoints.map(function (point) {
                     return [
                         point.title || "Brez naslova",
@@ -974,7 +972,7 @@ def build_faiss_search_script() -> str:
             traces,
             {
                 template: "plotly_white",
-                height: 620,
+                height: 520,
                 margin: {l: 42, r: 18, t: 24, b: 42},
                 xaxis: {title: "Local 1", zeroline: false},
                 yaxis: {title: "Local 2", zeroline: false},
